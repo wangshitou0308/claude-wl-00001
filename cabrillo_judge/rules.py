@@ -99,6 +99,10 @@ def default_rules(contest: str = "DEMO-CW") -> dict[str, Any]:
             "by_band": {},
             "by_mode": {},
         },
+        # UNIQUE（对方交了日志但无此记录）默认仅 0 分、不自动罚分；
+        # 裁判可在裁决时施加 NOT_IN_LOG 罚目。如赛事规则要求自动罚分，
+        # 将其设为 true。
+        "auto_penalty_unique": False,
         "multipliers": [
             # 示例：按通联到的不同呼号计乘数
             {"type": "worked_call", "name": "不同对方呼号"},
@@ -107,6 +111,7 @@ def default_rules(contest: str = "DEMO-CW") -> dict[str, Any]:
             # 裁判可施加的命名罚分目录（分值为从总分扣减的正数）
             "BAD_EXCHANGE": {"points": 2, "label": "抄收交换错误"},
             "NOT_IN_LOG": {"points": 5, "label": "对方日志无此记录"},
+            "DUP": {"points": 0, "label": "重复通联（默认不扣分，可配置）"},
             "UNIQUE_PENALTY": {"points": 10, "label": "裁判手动罚分"},
         },
         # 可选竞赛窗口，UTC，ISO-8601；为 None 时不检查

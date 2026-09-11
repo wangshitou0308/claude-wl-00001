@@ -11,6 +11,12 @@ import re
 import datetime as _dt
 from typing import Any
 
+from .rules import (
+    DEFAULT_CATEGORIES,
+    DEFAULT_REQUIRED_HEADERS,
+    KNOWN_TAGS,
+)
+
 # ---------------------------------------------------------------------------
 # Callsign helpers
 # ---------------------------------------------------------------------------
@@ -18,30 +24,42 @@ from typing import Any
 # Loose ITU-style base call: optional digit prefix, 1-3 letters, separating
 # digit(s), 1-4 trailing letters.  Covers e.g. W1AW, BG7AAF, 4X1ABC, 3DA0A.
 _BASE_CALL_RE = re.compile(r"^[0-9]?[A-Z]{1,3}[0-9]+[A-Z]{1,4}$")
-_SEGMENT_RE = re.compile(r"^[A-Z0-9]{1,5}$")
+# A slash segment that is *not* a base call (P, QRP, M, AM ...).  Base calls
+# themselves may be up to 9 characters (e.g. 3DA0ABC); ordinary suffixes are
+# shorter.  Length 15 leaves room for "F/EA8/MM"-style composites.
+_SEGMENT_RE = re.compile(r"^[A-Z0-9]{1,9}$")
 
 
 def normalize_callsign(call: str | None) -> str | None:
-    """Return the base call (uppercase, before any ``/``) or ``None``."""
+    """Return the base call (uppercase) or ``None``.
+
+    Handles both suffix form (``EA4E/P``, ``W1AW/QRP``) and prefix form
+    (``F/ON4XYZ``, ``EA8/DL1ABC/P``): every slash-separated segment is tested
+    and the first one matching the base-call grammar wins.
+    """
     if not call:
         return None
     token = call.strip().upper()
-    base = token.split("/", 1)[0]
-    if _BASE_CALL_RE.match(base) and 3 <= len(base) <= 9 and any(ch.isalpha() for ch in base):
-        return base
+    segments = token.split("/")
+    # Prefer the first segment if it itself is a base call (the common case),
+    # otherwise scan the remaining segments for a prefix-style base call.
+    for seg in segments:
+        if _BASE_CALL_RE.match(seg) and 3 <= len(seg) <= 9 \
+                and any(ch.isalpha() for ch in seg):
+            return seg
     return None
 
 
 def is_valid_callsign(call: str | None) -> bool:
     """Validate a full Cabrillo call field, allowing portable/mobile suffixes.
 
-    Accepts ``EA4E``, ``EA4E/P``, ``F/ON4XYZ``, ``ON4XYZ/QRP`` etc.  One
-    slash-separated segment must be a valid base call.
+    Accepts ``EA4E``, ``EA4E/P``, ``F/ON4XYZ``, ``ON4XYZ/QRP`` etc.  At least
+    one slash-separated segment must be a valid base call.
     """
     if not call:
         return False
     token = call.strip().upper()
-    if not token or len(token) > 14:
+    if not token or len(token) > 15:
         return False
     segments = token.split("/")
     has_base = False
@@ -133,8 +151,9 @@ def parse_cabrillo(text: str, rules: dict[str, Any]) -> dict[str, Any]:
     mode_aliases = rules.get("mode_aliases", {})
     exchange_specs = rules.get("exchange_fields", [])
     n_exch = len(exchange_specs)
-    required_headers = [h.upper() for h in rules.get("required_headers", [])]
-    allowed_categories = rules.get("allowed_categories", {})
+    required_headers = [h.upper() for h in
+                        rules.get("required_headers") or DEFAULT_REQUIRED_HEADERS]
+    allowed_categories = rules.get("allowed_categories") or DEFAULT_CATEGORIES
 
     # Normalise newlines; keep line numbers faithful to the submitted text.
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -312,17 +331,15 @@ def parse_cabrillo(text: str, rules: dict[str, Any]) -> dict[str, Any]:
             if qso_started:
                 issues.append(_issue("warning", "HEADER_AFTER_QSO",
                                      f"头标签 {tag} 出现在 QSO 行之后", idx))
-            if tag not in {t.upper() for t in
-                           ("START-OF-LOG", "END-OF-LOG") | set()}:
-                if tag not in _known_tag_union():
-                    issues.append(_issue("warning", "UNKNOWN_TAG",
-                                         f"未知头标签 {tag}", idx))
+            if tag not in KNOWN_TAGS:
+                issues.append(_issue("warning", "UNKNOWN_TAG",
+                                     f"未知头标签 {tag}", idx))
             if tag == "CONTEST" and value.upper() != str(rules.get("contest", "")).upper():
                 issues.append(_issue("error", "CONTEST_MISMATCH",
                                      f"CONTEST={value!r} 与规则 "
                                      f"{rules.get('contest')!r} 不符", idx))
-            if tag.startswith("CATEGORY-") and tag in allowed_categories:
-                valid_values = allowed_categories[tag]
+            if tag.startswith("CATEGORY-") and tag[9:] in allowed_categories:
+                valid_values = allowed_categories[tag[9:]]
                 if value not in valid_values:
                     issues.append(_issue("error", "BAD_CATEGORY",
                                          f"{tag}={value!r}，允许值："
@@ -372,11 +389,6 @@ def parse_cabrillo(text: str, rules: dict[str, Any]) -> dict[str, Any]:
         "station_call": station_call,
         "contest": contest,
     }
-
-
-def _known_tag_union() -> set[str]:
-    from .rules import KNOWN_TAGS
-    return set(KNOWN_TAGS)
 
 
 def raw_tags_line(raw_tags: list[tuple[int, str, str]], tag: str) -> int | None:
