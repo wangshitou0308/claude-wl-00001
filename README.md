@@ -77,8 +77,10 @@ curl -s $B/api/batches/$BID/download -o result.json
 | 交换字段 | 按规则中 `exchange_fields` 的顺序与类型（rst/integer/string/grid/callsign/enum）逐字段校验 |
 | 其他 | `END-OF-LOG`、重复头、未知标签、QSO 字段数、X-QSO（永不参与配对计分）等 |
 
-严重问题（缺头、坏频段、坏模式、坏时间、坏对方呼号、交换字段不合法等）为 `error`；
-未知标签、缺 END 行等为 `warning`。字段级错误的 QSO 行保留在 `invalid_qsos` 中但不参与配对。
+严重问题（缺头、坏频段、坏模式、坏时间、坏频率、越竞赛窗口、坏对方呼号、
+交换字段不合法等）为 `error`；未知标签、缺 END 行等为 `warning`。
+**任何一行只要出现 error 级字段问题，整行就进入 `invalid_qsos`（保留原始行
+与全部错误码），不会进入 `qsos`/`xqsos`，因而绝不可能参与交叉配对或计分。**
 
 ## 配对状态与裁决动作
 

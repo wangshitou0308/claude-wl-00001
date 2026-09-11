@@ -153,12 +153,13 @@ def adjudicate(rules: dict[str, Any],
     subs = [s for s in submissions if s.get("station_call")]
     station_of: dict[str, dict[str, Any]] = {s["station_call"]: s for s in subs}
 
-    # Attach owner to every usable QSO; X-QSO and invalid lines never pair.
+    # Attach owner to every usable QSO.  The parser has already diverted bad
+    # band/mode/time/frequency/call/exchange/window lines to invalid_qsos, and
+    # X-QSO lines live in a separate bucket, so every qsos entry is pairable.
     owned: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for sub in subs:
         for qso in sub["parsed"]["qsos"]:
-            if qso.get("in_window", True):
-                owned.append((sub, qso))
+            owned.append((sub, qso))
 
     findings: list[dict[str, Any]] = []
 

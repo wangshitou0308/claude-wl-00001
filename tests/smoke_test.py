@@ -101,11 +101,76 @@ check("演示数据出现 TIME_DRIFT", "TIME_DRIFT" in statuses)
 check("演示数据出现 UNIQUE(BG3CCC)", "UNIQUE" in statuses)
 check("演示数据出现 NO_PARTNER_LOG(BG4DDD)", "NO_PARTNER_LOG" in statuses)
 check("演示数据出现 DUP", "DUP" in statuses)
+check("演示数据出现 SUSPECT_CALL（BG1AAB 疑似抄错）",
+      "SUSPECT_CALL" in statuses)
+check("示例数据覆盖全部七种配对状态",
+      statuses == sorted(["MATCH", "EXCHANGE_DIFF", "TIME_DRIFT",
+                          "SUSPECT_CALL", "NO_PARTNER_LOG", "UNIQUE", "DUP"]),
+      str(statuses))
+suspect = next(f for f in res["findings"] if f["status"] == "SUSPECT_CALL")
+check("SUSPECT_CALL 标为待裁决", suspect["pending"] is True)
+check("SUSPECT_CALL 证据定位到双方原始行",
+      [r["filename"] for r in suspect["refs"]] == ["BG1AAA.log", "BG3CCC.log"]
+      and all(r["raw"].startswith("QSO:") for r in suspect["refs"]))
+check("SUSPECT_CALL 抄错细节 BG1AAA->BG1AAB",
+      suspect["call_detail"].get("b_logged") == "BG1AAB"
+      and suspect["call_detail"].get("b_actual") == "BG1AAA",
+      str(suspect["call_detail"]))
+
+# --- Field-level invalid QSO rows must never participate in pairing ---------
+BAD_LOG = """START-OF-LOG: 3.0
+CALLSIGN: BG7BAD
+CONTEST: DEMO-CW
+CATEGORY-MODE: CW
+CATEGORY-BANDS: ALL
+CATEGORY-OPERATOR: SINGLE-OP
+CATEGORY-POWER: LOW
+QSO: 7023 CW 2026-09-10 0500 BG7BAD 599 001 !!NOPE!! 599 001
+QSO: 7023 CW 2026-09-10 0510 BG7BAD 59A 002 BG2BBB 599 abc
+QSO: 7023 CW 2026-09-10 0520 BG7BAD 599 003 BG2BBB 599 030
+END-OF-LOG:
+"""
+PARTNER_LOG = """START-OF-LOG: 3.0
+CALLSIGN: BG2BBB
+CONTEST: DEMO-CW
+CATEGORY-MODE: CW
+CATEGORY-BANDS: ALL
+CATEGORY-OPERATOR: SINGLE-OP
+CATEGORY-POWER: HIGH
+QSO: 7023 CW 2026-09-10 0510 BG2BBB 599 002 BG7BAD 59A 002
+QSO: 7023 CW 2026-09-10 0520 BG2BBB 599 030 BG7BAD 599 003
+END-OF-LOG:
+"""
+pbad = parse_cabrillo(BAD_LOG, rules)
+pptn = parse_cabrillo(PARTNER_LOG, rules)
+check("坏对方呼号/坏交换行进入 invalid_qsos 而非 qsos",
+      len(pbad["qsos"]) == 1
+      and {iv["line"] for iv in pbad["invalid_qsos"]} == {8, 9}
+      and {c for iv in pbad["invalid_qsos"] for c in iv["errors"]}
+      == {"BAD_WORKED_CALL", "BAD_EXCHANGE"},
+      f"qsos={len(pbad['qsos'])} invalid={pbad['invalid_qsos']}")
+check("invalid_qsos 保留原始行",
+      all(iv["raw"].startswith("QSO:") for iv in pbad["invalid_qsos"]))
+check("对方日志收到坏交换也被判无效",
+      len(pptn["qsos"]) == 1 and pptn["invalid_qsos"][0]["errors"]
+      == ["BAD_EXCHANGE"])
+bsubs = [{"log_id": "X1", "filename": "bad.log",
+          "station_call": pbad["station_call"], "parsed": pbad},
+         {"log_id": "X2", "filename": "partner.log",
+          "station_call": pptn["station_call"], "parsed": pptn}]
+bfindings = adjudicate(rules, bsubs)["findings"]
+check("无效 QSO 行不参与配对（仅合法行 0520 成 MATCH）",
+      len(bfindings) == 1 and bfindings[0]["status"] == "MATCH"
+      and {r["line"] for r in bfindings[0]["refs"]} == {10, 9},
+      str([(f["status"], [r["line"] for r in f["refs"]])
+           for f in bfindings]))
+
 annotated = apply_decisions(rules, res["findings"], {})
 scored = score(rules, annotated)
 print(json.dumps(scored["scorecards"], ensure_ascii=False, indent=1))
-check("两家台站都有计分卡",
-      {c["station"] for c in scored["scorecards"]} == {"BG1AAA", "BG2BBB"})
+check("三家台站都有计分卡（含 X-QSO 不配对的 BG3CCC 在 SUSPECT_CALL 中）",
+      {c["station"] for c in scored["scorecards"]}
+      == {"BG1AAA", "BG2BBB", "BG3CCC"})
 
 # --- Storage round trip -------------------------------------------------------
 with tempfile.TemporaryDirectory() as d:

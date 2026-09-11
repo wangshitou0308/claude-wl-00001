@@ -201,47 +201,38 @@ def parse_cabrillo(text: str, rules: dict[str, Any]) -> dict[str, Any]:
                 continue
 
             _, freq_s, mode_s, date_s, time_s = tokens[:5]
-            critical = False
+            line_errors: list[str] = []
 
-            if not re.match(r"^[0-9]+$", freq_s):
+            freq = int(freq_s) if re.match(r"^[0-9]+$", freq_s) else None
+            if freq is None:
                 issues.append(_issue("error", "BAD_FREQUENCY",
                                      f"频率字段 {freq_s!r} 不是整数 kHz", idx))
-                critical = True
+                line_errors.append("BAD_FREQUENCY")
             ts = _parse_utc_timestamp(date_s, time_s)
             if ts is None:
                 issues.append(_issue("error", "BAD_TIME",
                                      f"UTC 日期/时间 {date_s} {time_s} 无法解析",
                                      idx))
-                critical = True
+                line_errors.append("BAD_TIME")
 
             mode_norm = mode_aliases.get(mode_s.upper(), mode_s.upper())
 
-            if critical:
-                invalid_qsos.append({"line": idx, "raw": raw,
-                                     "error": "QSO_CRITICAL"})
-                continue
-
-            freq = int(freq_s)
-            band = band_for_freq(freq, bands)
-            if band is None:
+            band = band_for_freq(freq, bands) if freq is not None else None
+            if freq is not None and band is None:
                 issues.append(_issue("error", "BAD_BAND",
                                      f"频率 {freq} kHz 不在规则定义的任何频段内",
                                      idx))
-                invalid_qsos.append({"line": idx, "raw": raw,
-                                     "error": "BAD_BAND"})
-                continue
+                line_errors.append("BAD_BAND")
             if allowed_modes and mode_norm not in allowed_modes:
                 issues.append(_issue("error", "BAD_MODE",
                                      f"模式 {mode_s!r}（归一为 {mode_norm}）"
                                      f"不在允许模式 {allowed_modes} 内", idx))
-                # 记录保留但不参与配对
-                invalid_qsos.append({"line": idx, "raw": raw,
-                                     "error": "BAD_MODE"})
-                continue
+                line_errors.append("BAD_MODE")
 
             # Contest window (optional).
             window_ok = True
-            if rules.get("contest_start") and rules.get("contest_end"):
+            if ts is not None and rules.get("contest_start") and \
+                    rules.get("contest_end"):
                 start_ts = _parse_utc_timestamp(rules["contest_start"][:10],
                                                 rules["contest_start"][11:15]
                                                 if len(rules["contest_start"]) > 10
@@ -254,6 +245,7 @@ def parse_cabrillo(text: str, rules: dict[str, Any]) -> dict[str, Any]:
                     issues.append(_issue("error", "OUTSIDE_WINDOW",
                                          f"时间 {date_s} {time_s} 超出竞赛窗口",
                                          idx))
+                    line_errors.append("OUTSIDE_WINDOW")
                     window_ok = False
 
             call1, call2 = tokens[5], tokens[5 + n_exch + 1]
@@ -261,11 +253,13 @@ def parse_cabrillo(text: str, rules: dict[str, Any]) -> dict[str, Any]:
             recv = tokens[6 + n_exch + 1:6 + n_exch + 1 + n_exch]
 
             if not is_valid_callsign(call1):
+                # 本方呼号可疑只警告（台站归属以 CALLSIGN 头为准），不使该行失效
                 issues.append(_issue("warning", "OWN_CALL_IN_QSO",
                                      f"QSO 中本方呼号 {call1!r} 格式可疑", idx))
             if not is_valid_callsign(call2):
                 issues.append(_issue("error", "BAD_WORKED_CALL",
                                      f"对方呼号 {call2!r} 格式不合法", idx))
+                line_errors.append("BAD_WORKED_CALL")
 
             exch_problems = []
             for spec, val in zip(exchange_specs, sent):
@@ -278,6 +272,24 @@ def parse_cabrillo(text: str, rules: dict[str, Any]) -> dict[str, Any]:
                 issues.append(_issue("error", "BAD_EXCHANGE",
                                      "交换字段不合法：" + "，".join(exch_problems),
                                      idx))
+                line_errors.append("BAD_EXCHANGE")
+
+            # 任何 error 级字段问题都使整行成为无效记录：保留原始行，但绝不
+            # 进入 qsos/xqsos，因此不可能参与交叉配对或计分。
+            if line_errors:
+                invalid_qsos.append({
+                    "line": idx, "raw": raw, "tag": "X-QSO" if is_x else "QSO",
+                    "error": line_errors[0], "errors": line_errors,
+                    "freq_khz": freq, "band": band, "mode": mode_norm,
+                    "ts": ts, "date": date_s if ts is not None else None,
+                    "time": time_s if ts is not None else None,
+                    "call1": call1.upper(), "call2": call2.upper(),
+                    "sent": {spec["name"]: v
+                             for spec, v in zip(exchange_specs, sent)},
+                    "recv": {spec["name"]: v
+                             for spec, v in zip(exchange_specs, recv)},
+                })
+                continue
 
             qso = {
                 "seq": (len(qsos) + len(xqsos) + 1),
@@ -295,7 +307,7 @@ def parse_cabrillo(text: str, rules: dict[str, Any]) -> dict[str, Any]:
                 "worked_call_norm": normalize_callsign(call2),
                 "sent": {spec["name"]: v for spec, v in zip(exchange_specs, sent)},
                 "recv": {spec["name"]: v for spec, v in zip(exchange_specs, recv)},
-                "exchange_valid": not exch_problems,
+                "exchange_valid": True,
                 "in_window": window_ok,
                 "is_x": is_x,
             }
