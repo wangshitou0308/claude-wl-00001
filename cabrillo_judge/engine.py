@@ -15,10 +15,18 @@ UNIQUE         对方交了日志但其中无此记录（单方记录）
 DUP            本方日志内的重复通联
 
 凡仅凭现有日志不能唯一判定的状态 ``pending=True``，裁判必须给出理由才能改判。
+
+时钟校正
+--------
+:func:`adjudicate` 接受 ``time_offsets={log_id: seconds}``（来自已启用的
+整分钟校正方案）。偏移只作用于配对用的时间戳；每条 QSO 引用同时保留
+原始 ``ts``/``date``/``time`` 与 ``corrected_*``/``offset_seconds``，
+原始 Cabrillo 文本与时间永不修改。
 """
 
 from __future__ import annotations
 
+import datetime as _dt
 import hashlib
 import json
 from typing import Any
@@ -61,12 +69,20 @@ def _levenshtein(a: str, b: str, cutoff: int) -> int:
 # Pairing
 # ---------------------------------------------------------------------------
 
-def _qso_ref(sub: dict[str, Any], qso: dict[str, Any]) -> dict[str, Any]:
+def _ts_date_time(ts: int) -> tuple[str, str]:
+    dt = _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc)
+    return dt.strftime("%Y-%m-%d"), dt.strftime("%H%M")
+
+
+def _qso_ref(sub: dict[str, Any], qso: dict[str, Any],
+             offset_seconds: int = 0) -> dict[str, Any]:
     raw_text = ""
     for rl in sub["parsed"]["raw_lines"]:
         if rl["line"] == qso["line"]:
             raw_text = rl["text"]
             break
+    corrected_ts = qso["ts"] + offset_seconds
+    corrected_date, corrected_time = _ts_date_time(corrected_ts)
     return {
         "log_id": sub["log_id"],
         "filename": sub["filename"],
@@ -75,6 +91,10 @@ def _qso_ref(sub: dict[str, Any], qso: dict[str, Any]) -> dict[str, Any]:
         "ts": qso["ts"],
         "date": qso["date"],
         "time": qso["time"],
+        "offset_seconds": offset_seconds,
+        "corrected_ts": corrected_ts,
+        "corrected_date": corrected_date,
+        "corrected_time": corrected_time,
         "freq_khz": qso["freq_khz"],
         "band": qso["band"],
         "mode": qso["mode"],
@@ -108,6 +128,7 @@ def _make_finding(status: str, refs: list[dict[str, Any]], band: str,
         "ts_hint": ts_hint,
         "stations": stations,
         "refs": refs,
+        "clock_corrected": any(r.get("offset_seconds") for r in refs),
         "time_delta_seconds": time_delta,
         "exchange_diffs": exchange_diffs or [],
         "call_detail": call_detail or {},
@@ -136,17 +157,29 @@ def _exchange_diffs(rules: dict[str, Any], a: dict[str, Any],
 
 
 def adjudicate(rules: dict[str, Any],
-               submissions: list[dict[str, Any]]) -> dict[str, Any]:
+               submissions: list[dict[str, Any]],
+               time_offsets: dict[str, int] | None = None) -> dict[str, Any]:
     """Run the whole pairing pass.
 
     *submissions* items: ``{log_id, filename, station_call, parsed}`` where
     ``parsed`` is the result of :func:`cabrillo_judge.parser.parse_cabrillo`.
+    *time_offsets* optionally maps ``log_id`` to seconds added to that log's
+    timestamps for pairing (clock-skew correction scheme); original times
+    are always preserved on the evidence refs.
     Returns ``{"findings": [...]}`` ordered deterministically.
     """
     tol = int(rules.get("pairing", {}).get("time_tolerance_seconds", 300))
     near = int(rules.get("pairing", {}).get("near_window_seconds",
                                            max(tol * 6, 1800)))
     fuzzy_max = int(rules.get("pairing", {}).get("call_fuzzy_distance", 2))
+    offsets = {str(k): int(v) for k, v in (time_offsets or {}).items()}
+
+    def _off(sub: dict[str, Any]) -> int:
+        return offsets.get(sub["log_id"], 0)
+
+    def _ets(sub: dict[str, Any], qso: dict[str, Any]) -> int:
+        """配对用的（校正后）时间戳；原始 ts 在证据中保留。"""
+        return qso["ts"] + _off(sub)
 
     # Only submissions with a normalisable own callsign can participate in
     # pairing; others are still kept (their validation issues are reported).
@@ -201,7 +234,7 @@ def adjudicate(rules: dict[str, Any],
                                        sub_b["station_call"])
                 if cscore == 0:
                     continue
-                delta = abs(qa["ts"] - qb["ts"])
+                delta = abs(_ets(sub_a, qa) - _ets(sub_b, qb))
                 if delta <= tol:
                     tscore = 2.0
                 elif delta <= near:
@@ -239,7 +272,8 @@ def adjudicate(rules: dict[str, Any],
             continue
         seen_pairs.add(pair_key)
 
-        refs = [_qso_ref(sub_a, qa), _qso_ref(sub_b, qb)]
+        refs = [_qso_ref(sub_a, qa, _off(sub_a)),
+                _qso_ref(sub_b, qb, _off(sub_b))]
         diffs = _exchange_diffs(rules, refs[0], refs[1])
         call_detail = {}
         wa = qa["worked_call_raw"]
@@ -270,7 +304,8 @@ def adjudicate(rules: dict[str, Any],
                       f"（时间差 {m['delta']} 秒）与交换字段完全一致")
         findings.append(_make_finding(
             status, refs, qa["band"], qa["mode"], reason,
-            min(qa["ts"], qb["ts"]), diffs, m["delta"], call_detail))
+            min(_ets(sub_a, qa), _ets(sub_b, qb)), diffs, m["delta"],
+            call_detail))
 
     # ------------------------------------------------------------------
     # 4) Leftover one-sided QSOs: classify as DUP / UNIQUE / NO_PARTNER_LOG.
@@ -280,7 +315,8 @@ def adjudicate(rules: dict[str, Any],
     # duplicate window is a DUP (the earlier one keeps UNIQUE/NO_PARTNER_LOG).
     by_key: dict[tuple[str, str, str, str],
                  list[tuple[dict, dict]]] = {}
-    for sub, q in sorted(owned, key=lambda sq: (sq[1]["ts"], sq[1]["line"])):
+    for sub, q in sorted(owned, key=lambda sq: (_ets(sq[0], sq[1]),
+                                                sq[1]["line"])):
         key = (sub["station_call"],
                q["worked_call_norm"] or q["worked_call_raw"],
                q["band"], q["mode"])
@@ -292,7 +328,7 @@ def adjudicate(rules: dict[str, Any],
         ka = (sub_a["log_id"], qa["line"])
         if ka in matched:
             continue
-        refs = [_qso_ref(sub_a, qa)]
+        refs = [_qso_ref(sub_a, qa, _off(sub_a))]
         key = (sub_a["station_call"],
                qa["worked_call_norm"] or qa["worked_call_raw"],
                qa["band"], qa["mode"])
@@ -301,21 +337,21 @@ def adjudicate(rules: dict[str, Any],
         my_pos = next(i for i, (s, q) in enumerate(chain)
                       if s["log_id"] == sub_a["log_id"] and q["line"] == qa["line"])
         for prev_sub, prev_q in reversed(chain[:my_pos]):
-            if abs(qa["ts"] - prev_q["ts"]) <= dup_window:
+            if abs(_ets(sub_a, qa) - _ets(prev_sub, prev_q)) <= dup_window:
                 dup_of = (prev_sub, prev_q)
                 break
         if dup_of is not None:
             prev_sub, prev_q = dup_of
-            refs.append(_qso_ref(prev_sub, prev_q))
+            refs.append(_qso_ref(prev_sub, prev_q, _off(prev_sub)))
             findings.append(_make_finding(
                 "DUP", refs, qa["band"], qa["mode"],
                 f"{sub_a['station_call']} 第 {qa['line']} 行与 "
                 f"{qa['worked_call_raw']} 在 {qa['band']}/{qa['mode']} 的"
                 f"较早记录（第 {prev_q['line']} 行，"
                 f"{prev_q['date']} {prev_q['time']}）相隔 "
-                f"{abs(qa['ts'] - prev_q['ts'])} 秒且未能交叉配对，"
+                f"{abs(_ets(sub_a, qa) - _ets(prev_sub, prev_q))} 秒且未能交叉配对，"
                 f"判为重复通联",
-                qa["ts"]))
+                _ets(sub_a, qa)))
             continue
 
         wanted = qa["worked_call_norm"]
@@ -327,7 +363,8 @@ def adjudicate(rules: dict[str, Any],
                       f"已提交的日志中无对应记录（单方记录）")
             # Point at the partner's log as evidence scope.
             findings.append(_make_finding(
-                "UNIQUE", refs, qa["band"], qa["mode"], reason, qa["ts"],
+                "UNIQUE", refs, qa["band"], qa["mode"], reason,
+                _ets(sub_a, qa),
                 call_detail={"partner_log": sub_b["filename"]}))
         else:
             status = "NO_PARTNER_LOG"
@@ -335,7 +372,8 @@ def adjudicate(rules: dict[str, Any],
                       f"{qa['worked_call_raw']} 在本批次中没有提交日志，"
                       f"无法交叉核实")
             findings.append(_make_finding(
-                status, refs, qso["band"], qa["mode"], reason, qa["ts"]))
+                status, refs, qa["band"], qa["mode"], reason,
+                _ets(sub_a, qa)))
 
     findings.sort(key=lambda f: (f["ts_hint"], f["status"], f["id"]))
     return {"findings": findings}
@@ -560,7 +598,8 @@ def _canonical(obj: Any) -> bytes:
 
 def content_hash(rules: dict[str, Any], findings: list[dict[str, Any]],
                  decisions: dict[str, dict[str, Any]],
-                 results: dict[str, Any]) -> str:
+                 results: dict[str, Any],
+                 clock_scheme: dict[str, Any] | None = None) -> str:
     # Evidence effects are derivable; hash the inputs that define a verdict.
     slim_findings = [{k: v for k, v in f.items()
                       if k in ("id", "status", "band", "mode", "ts_hint",
@@ -569,5 +608,6 @@ def content_hash(rules: dict[str, Any], findings: list[dict[str, Any]],
                                "auto_reason", "pending")}
                      for f in findings]
     payload = {"rules": rules, "findings": slim_findings,
-               "decisions": decisions, "results": results}
+               "decisions": decisions, "results": results,
+               "clock_scheme": clock_scheme}
     return hashlib.sha256(_canonical(payload)).hexdigest()

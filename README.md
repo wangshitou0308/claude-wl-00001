@@ -10,7 +10,9 @@
 ## 快速开始
 
 ```bash
-# 启动并自动创建包含 3 份日志的示例赛事（覆盖全部 7 种配对状态）
+# 启动并自动创建两个示例赛事：
+#   1) 3 份日志，覆盖全部 7 种配对状态
+#   2) 4 份日志的时钟偏差示例（快 6 分钟 / 慢 8 分钟 / 样本不足）
 python3 -m cabrillo_judge --reset-demo --demo --port 8080
 
 # 浏览器/终端打开
@@ -105,6 +107,69 @@ curl -s $B/api/batches/$BID/download -o result.json
 - `WAIVED` —— 豁免：不计分且免除罚分。
 - `REMOVED` —— 剔除记录。
 
+## 批次级时钟偏差分析与校正方案
+
+竞赛中常见某台计算机时钟快走/慢走几分钟，导致大量 `TIME_DRIFT` 待裁决。
+本功能在**不改动任何原始 Cabrillo 文本与时间**的前提下，估计并按整分钟
+校正这种系统性偏差。
+
+### 1. 分析（只读）
+
+```bash
+curl -s "$B/api/batches/$BID/clock-analysis?reference_log_id=$REF&max_window_seconds=1800"
+```
+
+裁判选定**参考日志**（时钟可信的那一份）与**最大搜索窗口**后，系统：
+
+1. 在任意两份日志间筛出**无歧义候选对**：呼号精确互指（不用模糊匹配）、
+   频段与模式一致、时间差在窗口内，且双方在窗口内都只有彼此一个候选；
+2. 按日志给出**时间差中位数、离散度（MAD）、样本数与覆盖时段**，并沿
+   候选对关系图从参考日志连通累计每份日志的估计偏差；
+3. 给出以**整分钟**为单位的建议偏移（语义：`校正时间 = 原始时间 + 偏移`）。
+
+以下情形**只列证据、不建议偏移**（`suggested_offset_minutes = null`，
+`suppress_reasons` 说明原因）：
+
+- 样本不足（默认少于 3 个无歧义候选对，可用 `min_samples` 调整）；
+- 偏差随时间变化（前后半程中位数相差超过 60 秒，单一整分钟偏移不可靠）；
+- 日志关系图与参考日志不连通（批次内没有可串联的互指候选对）。
+
+### 2. 建立与预览校正方案
+
+```bash
+# 手工指定整分钟偏移；也可用 "use_suggested": true 采纳分析建议（显式 offsets 优先）
+curl -s -X POST $B/api/batches/$BID/clock-schemes -H 'Content-Type: application/json' \
+  -d "{\"reference_log_id\":\"$REF\",\"name\":\"以 BG1AAA 为参考\",
+       \"offsets\":{\"$FAST_LOG\":-6}}"
+
+# 预览重跑配对后的状态计数与计分变化（不改动任何数据）
+curl -s -X POST $B/api/batches/$BID/clock-schemes/$SID/preview \
+  -H 'Content-Type: application/json' -d '{}'
+
+# 比较两个方案
+curl -s "$B/api/batches/$BID/clock-schemes/compare?a=$SID&b=$SID2"
+```
+
+`offsets` 只接受**整分钟整数**（±720 以内），参考日志偏移恒为 0；
+方案可停用、可删除（启用中须先停用）。
+
+### 3. 启用之后
+
+```bash
+curl -s -X POST $B/api/batches/$BID/clock-schemes/$SID/activate    # 启用（同时只启用一个）
+curl -s -X POST $B/api/batches/$BID/clock-schemes/$SID/deactivate  # 停用
+curl -s $B/api/batches/$BID/archived-decisions                     # 待复核的已归档裁决
+```
+
+- 启用后重跑交叉配对；每条证据的每个 QSO 引用同时保留**原时间**
+  （`ts/date/time`）、**校正时间**（`corrected_*`）与**偏移**
+  （`offset_seconds`），证据另有 `clock_corrected` 标记；
+- 配对或状态改变使既有裁决失去依据时，裁决被**归档并列入待复核**
+  （归档原因写明原状态与新状态），绝不静默沿用；复核后可
+  `DELETE .../archived-decisions/{aid}` 移除；
+- 启用中的方案随计分版本快照与 `content_hash` 持久化；
+  `GET .../download` 的完整 JSON 包含全部方案与归档裁决。
+
 ## 规则配置（可配置通联分、乘数、罚分）
 
 `POST /api/batches` 的 `rules` 字段（或 `PUT .../rules`）接受完整/部分规则对象，
@@ -178,6 +243,15 @@ QSO 数、乘数、罚分、总分的 a/b 差值及新增/变更的裁决。
 | GET | `/api/batches/{id}/versions/{no}` | 版本快照 |
 | GET | `/api/batches/{id}/versions/diff?a=&b=` | 版本比较 |
 | POST | `/api/batches/{id}/lock` | 锁定/解锁 |
+| GET | `/api/batches/{id}/clock-analysis` | 时钟偏差分析（`reference_log_id` 必填，`max_window_seconds`/`min_samples` 可选） |
+| POST/GET | `/api/batches/{id}/clock-schemes` | 建立/列出整分钟校正方案 |
+| GET/PUT/DELETE | `/api/batches/{id}/clock-schemes/{sid}` | 方案详情/修改/删除 |
+| POST | `/api/batches/{id}/clock-schemes/{sid}/activate` | 启用方案（重跑配对，失效裁决归档） |
+| POST | `/api/batches/{id}/clock-schemes/{sid}/deactivate` | 停用方案（恢复原始时间） |
+| POST | `/api/batches/{id}/clock-schemes/{sid}/preview` | 预览方案的状态计数与计分变化 |
+| POST | `/api/batches/{id}/clock-schemes/preview` | 临时偏移预览 |
+| GET | `/api/batches/{id}/clock-schemes/compare?a=&b=` | 比较两个方案 |
+| GET/DELETE | `/api/batches/{id}/archived-decisions[/{aid}]` | 待复核归档裁决列表/复核后移除 |
 | GET | `/api/batches/{id}/download` | 完整 JSON 下载 |
 
 ## 测试

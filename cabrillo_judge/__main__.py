@@ -83,6 +83,76 @@ END-OF-LOG:
 """
 
 
+# ---------------------------------------------------------------------------
+# 时钟偏差示例（独立批次）：BG2BBB 的钟快 6 分钟、BG3CCC 的钟慢 8 分钟
+# （均相对 BG1AAA），BG4DDD 只有 1 条互指 QSO（样本不足，只列证据不建议）。
+# 未校正时 A↔B、A↔C 全部落入 TIME_DRIFT；按建议整分钟校正后全部变为 MATCH。
+# ---------------------------------------------------------------------------
+SKEW_LOG_REF = """START-OF-LOG: 3.0
+CALLSIGN: BG1AAA
+CONTEST: DEMO-CW
+CATEGORY-MODE: CW
+CATEGORY-BANDS: ALL
+CATEGORY-OPERATOR: SINGLE-OP
+CATEGORY-POWER: LOW
+NAME: 参考台（时钟准确）
+CREATED-BY: hand-written
+QSO: 7023 CW 2026-09-10 0110 BG1AAA 599 001 BG2BBB 599 001
+QSO: 7023 CW 2026-09-10 0120 BG1AAA 599 002 BG3CCC 599 001
+QSO: 7023 CW 2026-09-10 0130 BG1AAA 599 003 BG4DDD 599 001
+QSO: 7023 CW 2026-09-10 0150 BG1AAA 599 004 BG2BBB 599 002
+QSO: 7023 CW 2026-09-10 0200 BG1AAA 599 005 BG3CCC 599 002
+QSO: 7023 CW 2026-09-10 0230 BG1AAA 599 006 BG2BBB 599 003
+QSO: 7023 CW 2026-09-10 0240 BG1AAA 599 007 BG3CCC 599 003
+QSO: 7023 CW 2026-09-10 0310 BG1AAA 599 008 BG2BBB 599 004
+END-OF-LOG:
+"""
+
+SKEW_LOG_FAST = """START-OF-LOG: 3.0
+CALLSIGN: BG2BBB
+CONTEST: DEMO-CW
+CATEGORY-MODE: CW
+CATEGORY-BANDS: ALL
+CATEGORY-OPERATOR: SINGLE-OP
+CATEGORY-POWER: LOW
+NAME: 快 6 分钟的台
+CREATED-BY: hand-written
+QSO: 7023 CW 2026-09-10 0116 BG2BBB 599 001 BG1AAA 599 001
+QSO: 7023 CW 2026-09-10 0156 BG2BBB 599 002 BG1AAA 599 004
+QSO: 7023 CW 2026-09-10 0236 BG2BBB 599 003 BG1AAA 599 006
+QSO: 7023 CW 2026-09-10 0316 BG2BBB 599 004 BG1AAA 599 008
+END-OF-LOG:
+"""
+
+SKEW_LOG_SLOW = """START-OF-LOG: 3.0
+CALLSIGN: BG3CCC
+CONTEST: DEMO-CW
+CATEGORY-MODE: CW
+CATEGORY-BANDS: ALL
+CATEGORY-OPERATOR: SINGLE-OP
+CATEGORY-POWER: LOW
+NAME: 慢 8 分钟的台
+CREATED-BY: hand-written
+QSO: 7023 CW 2026-09-10 0112 BG3CCC 599 001 BG1AAA 599 002
+QSO: 7023 CW 2026-09-10 0152 BG3CCC 599 002 BG1AAA 599 005
+QSO: 7023 CW 2026-09-10 0232 BG3CCC 599 003 BG1AAA 599 007
+END-OF-LOG:
+"""
+
+SKEW_LOG_THIN = """START-OF-LOG: 3.0
+CALLSIGN: BG4DDD
+CONTEST: DEMO-CW
+CATEGORY-MODE: CW
+CATEGORY-BANDS: ALL
+CATEGORY-OPERATOR: SINGLE-OP
+CATEGORY-POWER: LOW
+NAME: 样本不足的台
+CREATED-BY: hand-written
+QSO: 7023 CW 2026-09-10 0130 BG4DDD 599 001 BG1AAA 599 003
+END-OF-LOG:
+"""
+
+
 def seed_demo(storage: Storage, reset: bool = False) -> str:
     existing = storage.list_batches()
     if not reset:
@@ -99,6 +169,30 @@ def seed_demo(storage: Storage, reset: bool = False) -> str:
         storage.add_log(new_id("L"), bid, filename, text, parsed)
 
     # Run the same cross-log pass the upload endpoint performs.
+    from .engine import adjudicate, apply_decisions
+    submissions = storage.get_submissions(bid)
+    findings = adjudicate(rules, submissions)["findings"]
+    findings = apply_decisions(rules, findings, storage.list_decisions(bid))
+    storage.replace_findings(bid, findings)
+    return bid
+
+
+def seed_clock_demo(storage: Storage) -> str:
+    """准备时钟偏差示例批次（不存在则创建）。"""
+    for b in storage.list_batches():
+        if b["name"] == "示例赛事 CLOCK-SKEW 时钟偏差":
+            return b["id"]
+    rules = default_rules()
+    batch = storage.create_batch(new_id("B"), "示例赛事 CLOCK-SKEW 时钟偏差",
+                                 rules)
+    bid = batch["id"]
+    for filename, text in (("skew-BG1AAA.log", SKEW_LOG_REF),
+                           ("skew-BG2BBB.log", SKEW_LOG_FAST),
+                           ("skew-BG3CCC.log", SKEW_LOG_SLOW),
+                           ("skew-BG4DDD.log", SKEW_LOG_THIN)):
+        parsed = parse_cabrillo(text, rules)
+        storage.add_log(new_id("L"), bid, filename, text, parsed)
+
     from .engine import adjudicate, apply_decisions
     submissions = storage.get_submissions(bid)
     findings = adjudicate(rules, submissions)["findings"]
@@ -127,8 +221,10 @@ def main(argv: list[str] | None = None) -> int:
 
     server = make_server(args.host, args.port, args.db)
     bid = None
+    skew_bid = None
     if args.demo or args.reset_demo:
         bid = seed_demo(server.storage, reset=args.reset_demo)  # type: ignore[attr-defined]
+        skew_bid = seed_clock_demo(server.storage)  # type: ignore[attr-defined]
 
     print("=" * 64)
     print(f"{DOC_TITLE}")
@@ -138,6 +234,10 @@ def main(argv: list[str] | None = None) -> int:
     if bid:
         print(f"示例赛事  : 批次 {bid}")
         print(f"  GET http://{args.host}:{args.port}/api/batches/{bid}/disputes")
+    if skew_bid:
+        print(f"时钟偏差示例: 批次 {skew_bid}")
+        print(f"  GET http://{args.host}:{args.port}/api/batches/{skew_bid}"
+              f"/clock-analysis?reference_log_id=<参考日志ID>")
     print("按 Ctrl+C 停止服务。")
     print("=" * 64)
     try:

@@ -63,6 +63,29 @@ CREATE TABLE IF NOT EXISTS versions (
     PRIMARY KEY (batch_id, version_no)
 );
 
+CREATE TABLE IF NOT EXISTS clock_schemes (
+    id                 TEXT PRIMARY KEY,
+    batch_id           TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    name               TEXT NOT NULL,
+    reference_log_id   TEXT NOT NULL,
+    max_window_seconds INTEGER NOT NULL,
+    offsets_json       TEXT NOT NULL,
+    analysis_json      TEXT,
+    active             INTEGER NOT NULL DEFAULT 0,
+    created_ts         INTEGER NOT NULL,
+    updated_ts         INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS decision_archive (
+    id             TEXT PRIMARY KEY,
+    batch_id       TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    finding_id     TEXT NOT NULL,
+    decision_json  TEXT NOT NULL,
+    archive_reason TEXT NOT NULL,
+    scheme_id      TEXT,
+    archived_ts    INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS api_keys (
     -- placeholder table for future offline tokens; unused today
     key TEXT PRIMARY KEY
@@ -146,7 +169,7 @@ class Storage:
             raise KeyError(f"批次 {batch_id} 不存在")
         if b["locked"]:
             raise PermissionError(f"批次 {batch_id} 已锁定，"
-                                  f"不能修改日志、规则或裁决")
+                                  f"不能修改日志、规则、裁决或校正方案")
 
     # -- logs -------------------------------------------------------------
     def add_log(self, log_id: str, batch_id: str, filename: str,
@@ -320,3 +343,138 @@ class Storage:
                 "UPDATE batches SET updated_ts = ? WHERE id = ?",
                 (_now(), batch_id))
             self.conn.commit()
+
+    # -- clock-skew correction schemes --------------------------------------
+    def create_clock_scheme(self, scheme_id: str, batch_id: str, name: str,
+                            reference_log_id: str, max_window_seconds: int,
+                            offsets: dict[str, int],
+                            analysis: dict[str, Any] | None
+                            ) -> dict[str, Any]:
+        ts = _now()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO clock_schemes (id, batch_id, name, "
+                "reference_log_id, max_window_seconds, offsets_json, "
+                "analysis_json, active, created_ts, updated_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                (scheme_id, batch_id, name, reference_log_id,
+                 int(max_window_seconds),
+                 json.dumps(offsets, ensure_ascii=False),
+                 json.dumps(analysis, ensure_ascii=False)
+                 if analysis is not None else None, ts, ts))
+            self.conn.commit()
+        return self.get_clock_scheme(scheme_id)
+
+    @staticmethod
+    def _scheme_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {"id": row["id"], "batch_id": row["batch_id"],
+                "name": row["name"],
+                "reference_log_id": row["reference_log_id"],
+                "max_window_seconds": row["max_window_seconds"],
+                "offsets": json.loads(row["offsets_json"]),
+                "analysis": (json.loads(row["analysis_json"])
+                             if row["analysis_json"] else None),
+                "active": bool(row["active"]),
+                "created_ts": row["created_ts"],
+                "updated_ts": row["updated_ts"]}
+
+    def get_clock_scheme(self, scheme_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM clock_schemes WHERE id = ?",
+            (scheme_id,)).fetchone()
+        return self._scheme_row(row) if row else None
+
+    def list_clock_schemes(self, batch_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM clock_schemes WHERE batch_id = ? "
+            "ORDER BY created_ts, id", (batch_id,)).fetchall()
+        return [self._scheme_row(r) for r in rows]
+
+    def get_active_clock_scheme(self, batch_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM clock_schemes WHERE batch_id = ? AND active = 1",
+            (batch_id,)).fetchone()
+        return self._scheme_row(row) if row else None
+
+    def update_clock_scheme(self, scheme_id: str,
+                            name: str | None = None,
+                            offsets: dict[str, int] | None = None,
+                            analysis: dict[str, Any] | None = None) -> None:
+        sets = ["updated_ts = ?"]
+        args: list[Any] = [_now()]
+        if name is not None:
+            sets.append("name = ?")
+            args.append(name)
+        if offsets is not None:
+            sets.append("offsets_json = ?")
+            args.append(json.dumps(offsets, ensure_ascii=False))
+        if analysis is not None:
+            sets.append("analysis_json = ?")
+            args.append(json.dumps(analysis, ensure_ascii=False))
+        args.append(scheme_id)
+        with self._lock:
+            self.conn.execute(
+                f"UPDATE clock_schemes SET {', '.join(sets)} WHERE id = ?",
+                args)
+            self.conn.commit()
+
+    def set_active_clock_scheme(self, batch_id: str,
+                                scheme_id: str | None) -> None:
+        """启用一个方案（同时停用本批次其他方案）；None 表示全部停用。"""
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    "UPDATE clock_schemes SET active = 0, updated_ts = ? "
+                    "WHERE batch_id = ?", (_now(), batch_id))
+                if scheme_id is not None:
+                    self.conn.execute(
+                        "UPDATE clock_schemes SET active = 1, updated_ts = ? "
+                        "WHERE id = ? AND batch_id = ?",
+                        (_now(), scheme_id, batch_id))
+
+    def delete_clock_scheme(self, scheme_id: str) -> None:
+        with self._lock:
+            self.conn.execute("DELETE FROM clock_schemes WHERE id = ?",
+                              (scheme_id,))
+            self.conn.commit()
+
+    # -- archived decisions (pending re-review) ------------------------------
+    def archive_decision(self, archive_id: str, batch_id: str,
+                         finding_id: str, decision: dict[str, Any],
+                         reason: str, scheme_id: str | None
+                         ) -> dict[str, Any]:
+        """把失去依据的裁决从 decisions 移入 decision_archive（同一事务）。"""
+        ts = _now()
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT INTO decision_archive (id, batch_id, finding_id, "
+                    "decision_json, archive_reason, scheme_id, archived_ts) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (archive_id, batch_id, finding_id,
+                     json.dumps(decision, ensure_ascii=False),
+                     reason, scheme_id, ts))
+                self.conn.execute(
+                    "DELETE FROM decisions WHERE batch_id = ? AND "
+                    "finding_id = ?", (batch_id, finding_id))
+        return {"id": archive_id, "finding_id": finding_id,
+                "decision": decision, "archive_reason": reason,
+                "scheme_id": scheme_id, "archived_ts": ts}
+
+    def list_archived_decisions(self, batch_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM decision_archive WHERE batch_id = ? "
+            "ORDER BY archived_ts, id", (batch_id,)).fetchall()
+        return [{"id": r["id"], "finding_id": r["finding_id"],
+                 "decision": json.loads(r["decision_json"]),
+                 "archive_reason": r["archive_reason"],
+                 "scheme_id": r["scheme_id"],
+                 "archived_ts": r["archived_ts"]} for r in rows]
+
+    def delete_archived_decision(self, batch_id: str, archive_id: str) -> bool:
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM decision_archive WHERE batch_id = ? AND id = ?",
+                (batch_id, archive_id))
+            self.conn.commit()
+            return cur.rowcount > 0

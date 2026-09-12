@@ -182,6 +182,307 @@ with tempfile.TemporaryDirectory() as d:
     check("存储层往返正常", len(st.list_logs(b["id"])) == 3)
     st.close()
 
+# --- 时钟偏差分析（clockskew） -------------------------------------------------
+from cabrillo_judge.clockskew import analyze_clock_skew
+from cabrillo_judge.__main__ import (SKEW_LOG_REF, SKEW_LOG_FAST,
+                                     SKEW_LOG_SLOW, SKEW_LOG_THIN)
+
+
+def _sub(log_id, filename, text, rules_):
+    p = parse_cabrillo(text, rules_)
+    return {"log_id": log_id, "filename": filename,
+            "station_call": p["station_call"], "parsed": p}
+
+
+s_subs = [_sub("LR", "ref.log", SKEW_LOG_REF, rules),
+          _sub("LF", "fast.log", SKEW_LOG_FAST, rules),
+          _sub("LS", "slow.log", SKEW_LOG_SLOW, rules),
+          _sub("LT", "thin.log", SKEW_LOG_THIN, rules)]
+rep = analyze_clock_skew(s_subs, "LR", 1800)
+sugg = rep["suggested_offsets_minutes"]
+check("时钟偏差分析建议快 6 分钟的日志偏移 -6 分钟",
+      sugg.get("LF") == -6, str(sugg))
+check("时钟偏差分析建议慢 8 分钟的日志偏移 +8 分钟",
+      sugg.get("LS") == 8, str(sugg))
+check("样本不足的日志不建议偏移", "LT" not in sugg, str(sugg))
+thin = next(l for l in rep["logs"] if l["log_id"] == "LT")
+check("样本不足只列证据（连通、有 1 个样本、说明原因）",
+      thin["connected"] and thin["suggested_offset_minutes"] is None
+      and thin["sample_count"] == 1
+      and any("样本不足" in r for r in thin["suppress_reasons"]),
+      json.dumps(thin, ensure_ascii=False))
+fast = next(l for l in rep["logs"] if l["log_id"] == "LF")
+check("按日志给出中位数/离散度/样本数/覆盖时段",
+      fast["median_seconds"] == 360 and fast["mad_seconds"] == 0
+      and fast["sample_count"] == 4
+      and fast["coverage"]["span_seconds"] == 7560
+      and fast["coverage"]["first"] == "2026-09-10T01:10",
+      json.dumps(fast, ensure_ascii=False))
+check("参考日志偏移恒为 0",
+      next(l for l in rep["logs"] if l["is_reference"])
+      ["suggested_offset_minutes"] == 0)
+
+# 偏差随时间变化 -> 不建议
+DRIFT_REF = """START-OF-LOG: 3.0
+CALLSIGN: BG1AAA
+CONTEST: DEMO-CW
+CATEGORY-MODE: CW
+CATEGORY-BANDS: ALL
+CATEGORY-OPERATOR: SINGLE-OP
+CATEGORY-POWER: LOW
+QSO: 7023 CW 2026-09-10 0100 BG1AAA 599 001 BG8DDD 599 001
+QSO: 7023 CW 2026-09-10 0140 BG1AAA 599 002 BG8DDD 599 002
+QSO: 7023 CW 2026-09-10 0220 BG1AAA 599 003 BG8DDD 599 003
+QSO: 7023 CW 2026-09-10 0300 BG1AAA 599 004 BG8DDD 599 004
+END-OF-LOG:
+"""
+DRIFT_LOG = """START-OF-LOG: 3.0
+CALLSIGN: BG8DDD
+CONTEST: DEMO-CW
+CATEGORY-MODE: CW
+CATEGORY-BANDS: ALL
+CATEGORY-OPERATOR: SINGLE-OP
+CATEGORY-POWER: LOW
+QSO: 7023 CW 2026-09-10 0101 BG8DDD 599 001 BG1AAA 599 001
+QSO: 7023 CW 2026-09-10 0141 BG8DDD 599 002 BG1AAA 599 002
+QSO: 7023 CW 2026-09-10 0229 BG8DDD 599 003 BG1AAA 599 003
+QSO: 7023 CW 2026-09-10 0309 BG8DDD 599 004 BG1AAA 599 004
+END-OF-LOG:
+"""
+d_subs = [_sub("DR", "drift-ref.log", DRIFT_REF, rules),
+          _sub("DD", "drift.log", DRIFT_LOG, rules)]
+drep = analyze_clock_skew(d_subs, "DR", 1800)
+dd = next(l for l in drep["logs"] if l["log_id"] == "DD")
+check("偏差随时间变化被检出", dd["drift_detected"] is True,
+      json.dumps(dd, ensure_ascii=False))
+check("偏差随时间变化时不建议偏移",
+      dd["suggested_offset_minutes"] is None
+      and any("随时间变化" in r for r in dd["suppress_reasons"]),
+      str(dd["suppress_reasons"]))
+
+# 日志关系不连通 -> 只列证据
+LONE_LOG = """START-OF-LOG: 3.0
+CALLSIGN: BG5EEE
+CONTEST: DEMO-CW
+CATEGORY-MODE: CW
+CATEGORY-BANDS: ALL
+CATEGORY-OPERATOR: SINGLE-OP
+CATEGORY-POWER: LOW
+QSO: 7023 CW 2026-09-10 0100 BG5EEE 599 001 BG9ZZZ 599 001
+QSO: 7023 CW 2026-09-10 0200 BG5EEE 599 002 BG9ZZZ 599 002
+END-OF-LOG:
+"""
+l_subs = [_sub("LR2", "ref2.log", SKEW_LOG_REF, rules),
+          _sub("LL", "lone.log", LONE_LOG, rules)]
+lrep = analyze_clock_skew(l_subs, "LR2", 1800)
+ll = next(l for l in lrep["logs"] if l["log_id"] == "LL")
+check("关系不连通的日志只列证据不建议",
+      ll["connected"] is False and ll["suggested_offset_minutes"] is None
+      and any("不连通" in r for r in ll["suppress_reasons"]),
+      json.dumps(ll, ensure_ascii=False))
+
+# --- 引擎时间偏移：校正后配对与证据字段 ---------------------------------------
+res_raw = adjudicate(rules, s_subs)
+st_raw = sorted(f["status"] for f in res_raw["findings"])
+check("未校正时 7 条 TIME_DRIFT + 1 条 MATCH",
+      st_raw == ["MATCH"] + ["TIME_DRIFT"] * 7, str(st_raw))
+res_fix = adjudicate(rules, s_subs, time_offsets={"LF": -360, "LS": 480})
+st_fix = sorted(f["status"] for f in res_fix["findings"])
+check("按建议校正后全部变为 MATCH", st_fix == ["MATCH"] * 8, str(st_fix))
+check("每条证据都带原时间/校正时间/偏移",
+      all({"ts", "corrected_ts", "offset_seconds", "corrected_time"}
+          <= set(r) for f in res_fix["findings"] for r in f["refs"]))
+fast_ref = next(r for f in res_fix["findings"] for r in f["refs"]
+                if r["log_id"] == "LF" and r["line"] == 10)
+check("原始时间不改，校正时间 = 原时间 + 偏移",
+      fast_ref["time"] == "0116" and fast_ref["corrected_time"] == "0110"
+      and fast_ref["offset_seconds"] == -360
+      and fast_ref["corrected_ts"] == fast_ref["ts"] - 360,
+      json.dumps(fast_ref, ensure_ascii=False))
+check("校正证据标记 clock_corrected",
+      all(f["clock_corrected"] for f in res_fix["findings"]
+          if any(r["log_id"] in ("LF", "LS") for r in f["refs"])))
+raw_id = {f["id"] for f in res_raw["findings"] if f["status"] == "MATCH"}
+fix_id = {f["id"] for f in res_fix["findings"]}
+check("配对不变时 finding id 稳定（MATCH 证据保持身份）",
+      raw_id <= fix_id)
+
+# --- 存储层：方案 CRUD 与裁决归档 ----------------------------------------------
+with tempfile.TemporaryDirectory() as d:
+    st = Storage(os.path.join(d, "t.db"))
+    b = st.create_batch(new_id("B"), "skew", rules)
+    bid = b["id"]
+    st.add_log("LR", bid, "ref.log", SKEW_LOG_REF,
+               parse_cabrillo(SKEW_LOG_REF, rules))
+    st.add_log("LF", bid, "fast.log", SKEW_LOG_FAST,
+               parse_cabrillo(SKEW_LOG_FAST, rules))
+    scheme = st.create_clock_scheme("S-1", bid, "测试方案", "LR", 1800,
+                                    {"LF": -6}, None)
+    check("方案创建后可读回", scheme["offsets"] == {"LF": -6}
+          and scheme["active"] is False)
+    st.set_active_clock_scheme(bid, "S-1")
+    check("启用后 get_active_clock_scheme 命中",
+          st.get_active_clock_scheme(bid)["id"] == "S-1")
+    st.set_active_clock_scheme(bid, None)
+    check("停用后无启用方案", st.get_active_clock_scheme(bid) is None)
+    dec = st.upsert_decision(bid, "F-x", "CONFIRMED", "测试理由", judge="甲")
+    st.archive_decision("A-1", bid, "F-x", dec, "测试归档", "S-1")
+    check("归档后原裁决不再生效", "F-x" not in st.list_decisions(bid))
+    arch = st.list_archived_decisions(bid)
+    check("归档裁决可列出（待复核）",
+          len(arch) == 1 and arch[0]["decision"]["resolution"] == "CONFIRMED"
+          and arch[0]["archive_reason"] == "测试归档")
+    check("归档条目可移除", st.delete_archived_decision(bid, "A-1")
+          and st.list_archived_decisions(bid) == [])
+    st.close()
+
+# --- HTTP 层：分析/方案/预览/归档/版本/下载 ------------------------------------
+import http.client
+import threading
+
+from cabrillo_judge.web import make_server
+
+with tempfile.TemporaryDirectory() as d:
+    server = make_server("127.0.0.1", 0, os.path.join(d, "t.db"))
+    port = server.server_address[1]
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+
+    def api(method, path, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        payload = json.dumps(body).encode() if body is not None else None
+        headers = {"Content-Type": "application/json"} if body else {}
+        conn.request(method, path, body=payload, headers=headers)
+        resp = conn.getresponse()
+        data = json.loads(resp.read().decode())
+        conn.close()
+        return resp.status, data
+
+    st_code, r = api("POST", "/api/batches", {"name": "skew-http"})
+    hid = r["batch"]["id"]
+    st_code, r = api("POST", f"/api/batches/{hid}/logs", {"logs": [
+        {"filename": "ref.log", "content": SKEW_LOG_REF},
+        {"filename": "fast.log", "content": SKEW_LOG_FAST},
+        {"filename": "slow.log", "content": SKEW_LOG_SLOW},
+        {"filename": "thin.log", "content": SKEW_LOG_THIN}]})
+    check("HTTP 上传 4 份日志", st_code == 201
+          and len(r["received"]) == 4, str(r)[:200])
+    lids = {x["station_call"]: x["log_id"] for x in r["received"]}
+    ref_id = lids["BG1AAA"]
+
+    st_code, r = api("GET", f"/api/batches/{hid}/clock-analysis"
+                            f"?reference_log_id={ref_id}&max_window_seconds=1800")
+    check("HTTP 分析接口给出建议", st_code == 200
+          and r["suggested_offsets_minutes"].get(lids["BG2BBB"]) == -6
+          and r["suggested_offsets_minutes"].get(lids["BG3CCC"]) == 8,
+          json.dumps(r.get("suggested_offsets_minutes")))
+    check("HTTP 分析按日志给出统计与覆盖时段",
+          any(l["station_call"] == "BG2BBB" and l["sample_count"] == 4
+              and l["median_seconds"] == 360
+              and l["coverage"]["span_seconds"] == 7560
+              for l in r["logs"]))
+    st_code, r = api("GET", f"/api/batches/{hid}/clock-analysis")
+    check("缺少 reference_log_id 返回 400", st_code == 400)
+
+    # 先对一条 TIME_DRIFT 裁决，启用方案后它应失去依据被归档
+    st_code, r = api("GET", f"/api/batches/{hid}/findings?status=TIME_DRIFT")
+    drift_fid = r["findings"][0]["id"]
+    st_code, r = api("POST",
+                     f"/api/batches/{hid}/findings/{drift_fid}/decision",
+                     {"resolution": "CONFIRMED", "reason": "测试：确认通联",
+                      "judge": "测试员"})
+    check("HTTP 裁决 TIME_DRIFT", st_code == 200, str(r)[:200])
+
+    st_code, r = api("POST", f"/api/batches/{hid}/clock-schemes",
+                     {"reference_log_id": ref_id, "name": "自动建议方案",
+                      "use_suggested": True, "activate": True})
+    check("HTTP 创建并启用方案", st_code == 201
+          and r["scheme"]["offsets"].get(lids["BG2BBB"]) == -6
+          and r["scheme"]["offsets"].get(lids["BG3CCC"]) == 8,
+          json.dumps(r.get("scheme"), ensure_ascii=False))
+    sid = r["scheme"]["id"]
+    check("启用后 TIME_DRIFT 全部转为 MATCH",
+          r["status_counts"]["before"].get("TIME_DRIFT") == 7
+          and r["status_counts"]["after"] == {"MATCH": 8},
+          json.dumps(r["status_counts"]))
+    check("失去依据的裁决被归档而非静默沿用",
+          len(r["archived_decisions"]) == 1
+          and r["archived_decisions"][0]["finding_id"] == drift_fid
+          and r["archived_decisions"][0]["decision"]["reason"]
+          == "测试：确认通联",
+          json.dumps(r["archived_decisions"], ensure_ascii=False))
+
+    st_code, r = api("GET", f"/api/batches/{hid}/archived-decisions")
+    check("待复核归档列表可查", st_code == 200 and r["count"] == 1)
+    aid = r["archived_decisions"][0]["id"]
+
+    st_code, r = api("GET", f"/api/batches/{hid}/findings?status=MATCH")
+    fref = next(x for f in r["findings"] for x in f["refs"]
+                if x["filename"] == "fast.log")
+    check("HTTP 证据同时保留原时间/校正时间/偏移",
+          fref["time"] == "0116" and fref["corrected_time"] == "0110"
+          and fref["offset_seconds"] == -360,
+          json.dumps(fref, ensure_ascii=False))
+
+    # 预览：临时去掉全部偏移 -> 回到 7 条 TIME_DRIFT；不改动数据
+    st_code, r = api("POST", f"/api/batches/{hid}/clock-schemes/preview",
+                     {"offsets": {}})
+    check("预览给出状态计数与计分变化",
+          st_code == 200
+          and r["current"]["status_counts"] == {"MATCH": 8}
+          and r["preview"]["status_counts"].get("TIME_DRIFT") == 7
+          and isinstance(r["scorecard_diff"], list),
+          json.dumps(r, ensure_ascii=False)[:300])
+    st_code, r = api("GET", f"/api/batches/{hid}/findings?status=MATCH")
+    check("预览不改动数据（仍 8 条 MATCH）", r["count"] == 8)
+
+    # 第二个方案（只校正快钟）用于比较
+    st_code, r = api("POST", f"/api/batches/{hid}/clock-schemes",
+                     {"reference_log_id": ref_id, "name": "只校正快钟",
+                      "offsets": {lids["BG2BBB"]: -6}})
+    sid2 = r["scheme"]["id"]
+    st_code, r = api("GET", f"/api/batches/{hid}/clock-schemes/compare"
+                            f"?a={sid}&b={sid2}")
+    check("方案比较接口给出两方案状态计数",
+          st_code == 200
+          and r["a"]["status_counts"] == {"MATCH": 8}
+          and r["b"]["status_counts"].get("TIME_DRIFT") == 3,
+          json.dumps(r, ensure_ascii=False)[:300])
+
+    # 方案随计分版本持久化
+    st_code, r = api("POST", f"/api/batches/{hid}/versions",
+                     {"note": "校正后版本"})
+    check("版本快照包含启用中的方案", st_code == 201, str(r)[:200])
+    st_code, r = api("GET", f"/api/batches/{hid}/versions/1")
+    check("版本快照包含启用中的方案",
+          r["snapshot"]["clock_scheme"]["offsets"].get(lids["BG2BBB"]) == -6,
+          json.dumps(r["snapshot"].get("clock_scheme"), ensure_ascii=False))
+
+    # 停用方案 -> 恢复原始时间；归档列表仍在
+    st_code, r = api("POST",
+                     f"/api/batches/{hid}/clock-schemes/{sid}/deactivate")
+    check("停用方案恢复 TIME_DRIFT",
+          st_code == 200
+          and r["status_counts"]["after"].get("TIME_DRIFT") == 7,
+          json.dumps(r, ensure_ascii=False)[:300])
+
+    # 下载包含方案与归档
+    st_code, r = api("GET", f"/api/batches/{hid}/download")
+    check("下载 JSON 含校正方案与归档裁决",
+          st_code == 200 and len(r["clock_schemes"]) == 2
+          and len(r["archived_decisions"]) == 1,
+          str(list(r.keys())))
+
+    # 复核后移除归档条目；未启用方案可删除
+    st_code, r = api("DELETE",
+                     f"/api/batches/{hid}/archived-decisions/{aid}")
+    check("复核后移除归档条目", st_code == 200)
+    st_code, r = api("DELETE", f"/api/batches/{hid}/clock-schemes/{sid2}")
+    check("删除未启用方案", st_code == 200)
+
+    server.shutdown()
+    server.server_close()
+
 print()
 if failures:
     print(f"{len(failures)} 项失败:", failures)

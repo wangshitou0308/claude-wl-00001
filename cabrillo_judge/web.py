@@ -21,6 +21,7 @@ from typing import Any
 from urllib.parse import urlparse, parse_qs
 
 from . import __version__
+from .clockskew import DEFAULT_MIN_SAMPLES, analyze_clock_skew
 from .engine import (
     PENDING_STATUSES,
     RESOLUTIONS,
@@ -88,8 +89,44 @@ API_SPEC: dict[str, Any] = {
          "desc": "版本比较，查询参数 a/b 为版本号；省略 b 与当前结果比"},
         {"method": "POST", "path": "/api/batches/{id}/lock",
          "desc": "锁定/解锁批次。JSON: {locked: true|false}"},
+        {"method": "GET", "path": "/api/batches/{id}/clock-analysis",
+         "desc": "批次级时钟偏差分析（只读）。查询参数 reference_log_id（必填）、"
+                 "max_window_seconds、min_samples；按日志给出时间差中位数、"
+                 "离散度(MAD)、样本数、覆盖时段与整分钟偏移建议"},
+        {"method": "POST", "path": "/api/batches/{id}/clock-schemes",
+         "desc": "建立整分钟校正方案。JSON: {reference_log_id, name?, "
+                 "max_window_seconds?, offsets?{日志ID:整分钟}, "
+                 "use_suggested?, activate?}"},
+        {"method": "GET", "path": "/api/batches/{id}/clock-schemes",
+         "desc": "列出本批次全部校正方案"},
+        {"method": "GET", "path": "/api/batches/{id}/clock-schemes/{sid}",
+         "desc": "方案详情（含创建时的分析快照）"},
+        {"method": "PUT", "path": "/api/batches/{id}/clock-schemes/{sid}",
+         "desc": "修改方案名称/偏移；若方案已启用则重跑配对并归档失效裁决"},
+        {"method": "DELETE", "path": "/api/batches/{id}/clock-schemes/{sid}",
+         "desc": "删除方案（启用中的方案须先停用）"},
+        {"method": "POST",
+         "path": "/api/batches/{id}/clock-schemes/{sid}/activate",
+         "desc": "启用方案：按整分钟偏移重跑配对，失去依据的裁决归档待复核"},
+        {"method": "POST",
+         "path": "/api/batches/{id}/clock-schemes/{sid}/deactivate",
+         "desc": "停用方案：恢复原始时间重跑配对，同样归档失效裁决"},
+        {"method": "POST",
+         "path": "/api/batches/{id}/clock-schemes/{sid}/preview",
+         "desc": "预览方案（可在 JSON.offsets 临时覆盖）：重跑后的状态计数、"
+                 "计分变化与将失去依据的裁决；不改动任何数据"},
+        {"method": "POST", "path": "/api/batches/{id}/clock-schemes/preview",
+         "desc": "临时偏移预览。JSON: {offsets: {日志ID: 整分钟}}"},
+        {"method": "GET", "path": "/api/batches/{id}/clock-schemes/compare",
+         "desc": "比较两个方案的配对状态计数与计分。查询参数 a/b 为方案 ID"},
+        {"method": "GET", "path": "/api/batches/{id}/archived-decisions",
+         "desc": "待复核的已归档裁决（因校正方案变化失去依据）"},
+        {"method": "DELETE",
+         "path": "/api/batches/{id}/archived-decisions/{aid}",
+         "desc": "复核后移除归档条目"},
         {"method": "GET", "path": "/api/batches/{id}/download",
-         "desc": "下载完整 JSON（规则、日志原文、证据、裁决、当前结果）"},
+         "desc": "下载完整 JSON（规则、日志原文、证据、裁决、校正方案、"
+                 "归档裁决、当前结果）"},
         {"method": "GET", "path": "/api/docs",
          "desc": "机器可读 API 说明（本对象）"},
     ],
@@ -107,6 +144,26 @@ API_SPEC: dict[str, Any] = {
         "GRANTED": "认定单方/对方未交日志的记录有效计分（NO_PARTNER_LOG）",
         "WAIVED": "豁免：记录不计分且免除自动罚分（UNIQUE/DUP/NO_PARTNER_LOG）",
         "REMOVED": "剔除该记录（不计分）",
+    },
+    "clock_skew": {
+        "summary": "批次级时钟偏差分析与整分钟校正方案；"
+                   "原始 Cabrillo 文本与时间永不修改",
+        "offset_semantics": "校正时间 = 原始时间 + 偏移（整分钟）；"
+                            "建议偏移使各日志与参考日志对齐",
+        "candidate_rule": "候选对须呼号精确互指、频段/模式一致、时间差在"
+                          "最大搜索窗口内，且双方在窗口内都只有彼此一个候选"
+                          "（无歧义）",
+        "no_suggestion_when": [
+            "样本不足（无歧义候选对少于 min_samples，默认 3）",
+            "偏差随时间变化（前后半程中位数相差超过 60 秒）",
+            "日志关系图与参考日志不连通",
+        ],
+        "evidence_fields": "启用方案后每条证据的 QSO 引用同时含原时间 "
+                           "ts/date/time、校正时间 corrected_* 与 "
+                           "offset_seconds",
+        "archiving": "启用/停用/修改方案会重跑配对；失去依据的既有裁决自动"
+                     "归档并列入待复核（GET .../archived-decisions），"
+                     "绝不静默沿用；方案随计分版本快照与 content_hash 持久化",
     },
 }
 
@@ -275,6 +332,55 @@ class JudgeHandler(BaseHTTPRequestHandler):
             m = re.fullmatch(r"/api/batches/([^/]+)/rerun", path)
             if m and method == "POST":
                 return self._rerun(m.group(1))
+            m = re.fullmatch(r"/api/batches/([^/]+)/clock-analysis", path)
+            if m and method == "GET":
+                return self._clock_analysis(m.group(1))
+            m = re.fullmatch(r"/api/batches/([^/]+)/clock-schemes", path)
+            if m:
+                bid = m.group(1)
+                if method == "GET":
+                    return self._list_schemes(bid)
+                if method == "POST":
+                    return self._create_scheme(bid)
+            # 字面量路由必须先于 {sid} 通配
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/clock-schemes/preview", path)
+            if m and method == "POST":
+                return self._preview_scheme(m.group(1), None)
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/clock-schemes/compare", path)
+            if m and method == "GET":
+                return self._compare_schemes(m.group(1))
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/clock-schemes/([^/]+)/activate", path)
+            if m and method == "POST":
+                return self._activate_scheme(m.group(1), m.group(2))
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/clock-schemes/([^/]+)/deactivate", path)
+            if m and method == "POST":
+                return self._deactivate_scheme(m.group(1), m.group(2))
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/clock-schemes/([^/]+)/preview", path)
+            if m and method == "POST":
+                return self._preview_scheme(m.group(1), m.group(2))
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/clock-schemes/([^/]+)", path)
+            if m:
+                bid, sid = m.group(1), m.group(2)
+                if method == "GET":
+                    return self._get_scheme(bid, sid)
+                if method == "PUT":
+                    return self._update_scheme(bid, sid)
+                if method == "DELETE":
+                    return self._delete_scheme(bid, sid)
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/archived-decisions", path)
+            if m and method == "GET":
+                return self._list_archived(m.group(1))
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/archived-decisions/([^/]+)", path)
+            if m and method == "DELETE":
+                return self._dismiss_archived(m.group(1), m.group(2))
             m = re.fullmatch(r"/api/batches/([^/]+)/disputes", path)
             if m and method == "GET":
                 return self._disputes(m.group(1))
@@ -344,9 +450,18 @@ class JudgeHandler(BaseHTTPRequestHandler):
                            f"批次 {bid} 不存在")
         return batch
 
-    def _compute_results(self, batch: dict[str, Any]) -> dict[str, Any]:
+    def _compute_results(self, batch: dict[str, Any],
+                         offsets_override: dict[str, int] | None = None
+                         ) -> dict[str, Any]:
         submissions = self.storage.get_submissions(batch["id"])
-        raw = adjudicate(batch["rules"], submissions)["findings"]
+        if offsets_override is None:
+            scheme = self.storage.get_active_clock_scheme(batch["id"])
+            offsets = ({k: v * 60 for k, v in scheme["offsets"].items()}
+                       if scheme else None)
+        else:
+            offsets = offsets_override
+        raw = adjudicate(batch["rules"], submissions,
+                         time_offsets=offsets)["findings"]
         decisions = self.storage.list_decisions(batch["id"])
         annotated = apply_decisions(batch["rules"], raw, decisions)
         results = score(batch["rules"], annotated)
@@ -359,6 +474,42 @@ class JudgeHandler(BaseHTTPRequestHandler):
         self.storage.replace_findings(bid, computed["findings"])
         self.storage.touch_batch(bid)
         return computed
+
+    def _rerun_with_archiving(self, bid: str,
+                              scheme_id: str | None = None) -> dict[str, Any]:
+        """校正方案启用/停用/修改后的重跑：失去依据的裁决归档待复核。
+
+        裁决的 finding 在新配对中消失（含状态改变——finding id 含状态）
+        即视为失去依据，移入 decision_archive，绝不静默沿用。
+        """
+        batch = self._get_batch_or_404(bid)
+        old_findings = self.storage.list_findings(bid)
+        old_status = {f["id"]: f["status"] for f in old_findings}
+        old_refs = {f["id"]: _refs_key(f) for f in old_findings}
+        computed = self._compute_results(batch)
+        new_findings = computed["findings"]
+        new_ids = {f["id"] for f in new_findings}
+        new_status_by_refs: dict[tuple, str] = {}
+        for f in new_findings:
+            new_status_by_refs.setdefault(_refs_key(f), f["status"])
+        archived = []
+        for fid, dec in sorted(self.storage.list_decisions(bid).items()):
+            if fid in new_ids:
+                continue
+            old_st = old_status.get(fid)
+            became = new_status_by_refs.get(old_refs.get(fid))
+            if old_st and became and became != old_st:
+                reason = (f"时钟校正方案变化后，原证据状态由 {old_st} 变为 "
+                          f"{became}，原裁决失去依据，归档待复核")
+            else:
+                reason = (f"时钟校正方案变化后，原证据（{old_st or '未知状态'}）"
+                          f"在新配对中已不存在，原裁决失去依据，归档待复核")
+            archived.append(self.storage.archive_decision(
+                new_id("A"), bid, fid, dec, reason, scheme_id))
+        self.storage.replace_findings(bid, new_findings)
+        self.storage.touch_batch(bid)
+        return {"computed": computed, "archived": archived,
+                "status_before": _status_counts(old_findings)}
 
     # -- endpoints ---------------------------------------------------------
     def _create_batch(self) -> None:
@@ -416,6 +567,7 @@ class JudgeHandler(BaseHTTPRequestHandler):
                 "warnings": [i for i in issues
                              if i["severity"] == "warning"],
             })
+        active_scheme = self.storage.get_active_clock_scheme(bid)
         self._send_json({
             "batch": _public_batch(batch),
             "logs": log_summaries,
@@ -423,6 +575,11 @@ class JudgeHandler(BaseHTTPRequestHandler):
             "pending_count": self._pending_count(bid),
             "decisions_count": len(self.storage.list_decisions(bid)),
             "versions": self.storage.list_versions(bid),
+            "active_clock_scheme": (_public_scheme(active_scheme)
+                                    if active_scheme else None),
+            "clock_schemes_count": len(self.storage.list_clock_schemes(bid)),
+            "archived_decisions_count":
+                len(self.storage.list_archived_decisions(bid)),
         })
 
     def _pending_count(self, bid: str) -> int:
@@ -539,6 +696,279 @@ class JudgeHandler(BaseHTTPRequestHandler):
         computed = self._rerun_store(bid)
         self._send_json({"findings_count": len(computed["findings"]),
                          "summary": computed["results"]["summary"]})
+
+    # -- 时钟偏差分析与校正方案 ---------------------------------------------
+    def _get_scheme_or_404(self, bid: str, sid: str) -> dict[str, Any]:
+        scheme = self.storage.get_clock_scheme(sid)
+        if not scheme or scheme["batch_id"] != bid:
+            raise ApiError(HTTPStatus.NOT_FOUND, "SCHEME_NOT_FOUND",
+                           f"校正方案 {sid} 不存在")
+        return scheme
+
+    def _validate_offsets(self, bid: str, offsets: Any,
+                          reference_log_id: str | None = None
+                          ) -> dict[str, int]:
+        """校验 {日志ID: 整分钟} 偏移表，返回去掉零值的规范化 dict。"""
+        if not isinstance(offsets, dict):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_OFFSETS",
+                           "offsets 必须是 {日志ID: 整分钟} 对象")
+        log_ids = {l["id"] for l in self.storage.list_logs(bid)}
+        out: dict[str, int] = {}
+        for lid, mins in offsets.items():
+            if lid not in log_ids:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_OFFSETS",
+                               f"日志 {lid} 不在批次 {bid} 中")
+            if isinstance(mins, bool) or not isinstance(mins, int):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_OFFSETS",
+                               f"偏移必须以整分钟为单位（整数）："
+                               f"{lid}={mins!r}")
+            if abs(mins) > 720:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_OFFSETS",
+                               f"偏移超过 ±720 分钟上限：{lid}={mins}")
+            if lid == reference_log_id and mins != 0:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_OFFSETS",
+                               "参考日志的偏移必须为 0")
+            if mins:
+                out[lid] = mins
+        return out
+
+    def _clock_analysis(self, bid: str) -> None:
+        batch = self._get_batch_or_404(bid)
+        q = self._query()
+        ref = q.get("reference_log_id")
+        if not ref:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "MISSING_PARAM",
+                           "需要查询参数 reference_log_id=<日志ID>")
+        log = self.storage.get_log(ref)
+        if not log or log["batch_id"] != bid:
+            raise ApiError(HTTPStatus.NOT_FOUND, "LOG_NOT_FOUND",
+                           f"参考日志 {ref} 不在批次 {bid} 中")
+        default_window = int(batch["rules"].get("pairing", {})
+                             .get("near_window_seconds", 1800))
+        try:
+            window = int(q.get("max_window_seconds") or default_window)
+            min_samples = int(q.get("min_samples") or DEFAULT_MIN_SAMPLES)
+        except ValueError as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PARAM",
+                           "max_window_seconds/min_samples 必须是整数") from exc
+        if window <= 0 or min_samples < 1:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PARAM",
+                           "max_window_seconds 必须为正，min_samples 至少为 1")
+        submissions = self.storage.get_submissions(bid)
+        report = analyze_clock_skew(submissions, ref, window,
+                                    min_samples=min_samples)
+        report["batch_id"] = bid
+        self._send_json(report)
+
+    def _create_scheme(self, bid: str) -> None:
+        self.storage.require_open(bid)
+        batch = self._get_batch_or_404(bid)
+        body = self._json_body()
+        ref = str(body.get("reference_log_id") or "")
+        log = self.storage.get_log(ref) if ref else None
+        if not log or log["batch_id"] != bid:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_REFERENCE",
+                           "reference_log_id 必须是批次内某份日志的 ID")
+        window = body.get("max_window_seconds")
+        if window is None:
+            window = int(batch["rules"].get("pairing", {})
+                         .get("near_window_seconds", 1800))
+        if isinstance(window, bool) or not isinstance(window, int) \
+                or window <= 0:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_WINDOW",
+                           "max_window_seconds 必须是正整数秒")
+        min_samples = body.get("min_samples") or DEFAULT_MIN_SAMPLES
+        if isinstance(min_samples, bool) or not isinstance(min_samples, int) \
+                or min_samples < 1:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PARAM",
+                           "min_samples 必须是正整数")
+        offsets = self._validate_offsets(bid, body.get("offsets") or {},
+                                         reference_log_id=ref)
+        submissions = self.storage.get_submissions(bid)
+        analysis = analyze_clock_skew(submissions, ref, window,
+                                      min_samples=min_samples)
+        if body.get("use_suggested"):
+            # 显式 offsets 优先；未指定的日志用分析建议填充
+            for lid, mins in analysis["suggested_offsets_minutes"].items():
+                offsets.setdefault(lid, mins)
+        name = str(body.get("name") or "").strip() or \
+            f"时钟校正方案（参考 {log['filename']}）"
+        sid = new_id("S")
+        scheme = self.storage.create_clock_scheme(
+            sid, bid, name, ref, window, offsets, analysis)
+        resp: dict[str, Any] = {
+            "scheme": _public_scheme(scheme),
+            "analysis": analysis,
+        }
+        if body.get("activate"):
+            self.storage.set_active_clock_scheme(bid, sid)
+            outcome = self._rerun_with_archiving(bid, scheme_id=sid)
+            resp["activated"] = True
+            resp["status_counts"] = {
+                "before": outcome["status_before"],
+                "after": _status_counts(outcome["computed"]["findings"])}
+            resp["archived_decisions"] = outcome["archived"]
+            resp["results_summary"] = outcome["computed"]["results"]["summary"]
+        self._send_json(resp, HTTPStatus.CREATED)
+
+    def _list_schemes(self, bid: str) -> None:
+        self._get_batch_or_404(bid)
+        schemes = self.storage.list_clock_schemes(bid)
+        self._send_json({"schemes": [_public_scheme(s) for s in schemes],
+                         "count": len(schemes)})
+
+    def _get_scheme(self, bid: str, sid: str) -> None:
+        self._get_batch_or_404(bid)
+        scheme = self._get_scheme_or_404(bid, sid)
+        self._send_json({"scheme": {**_public_scheme(scheme),
+                                    "analysis": scheme["analysis"]}})
+
+    def _update_scheme(self, bid: str, sid: str) -> None:
+        self.storage.require_open(bid)
+        self._get_batch_or_404(bid)
+        scheme = self._get_scheme_or_404(bid, sid)
+        body = self._json_body()
+        name = body.get("name")
+        if name is not None:
+            name = str(name).strip() or scheme["name"]
+        offsets = None
+        if "offsets" in body:
+            offsets = self._validate_offsets(
+                bid, body["offsets"] or {},
+                reference_log_id=scheme["reference_log_id"])
+        self.storage.update_clock_scheme(sid, name=name, offsets=offsets)
+        updated = self.storage.get_clock_scheme(sid)
+        resp: dict[str, Any] = {"scheme": _public_scheme(updated)}
+        if updated["active"] and offsets is not None:
+            outcome = self._rerun_with_archiving(bid, scheme_id=sid)
+            resp["status_counts"] = {
+                "before": outcome["status_before"],
+                "after": _status_counts(outcome["computed"]["findings"])}
+            resp["archived_decisions"] = outcome["archived"]
+            resp["results_summary"] = outcome["computed"]["results"]["summary"]
+        self._send_json(resp)
+
+    def _delete_scheme(self, bid: str, sid: str) -> None:
+        self.storage.require_open(bid)
+        self._get_batch_or_404(bid)
+        scheme = self._get_scheme_or_404(bid, sid)
+        if scheme["active"]:
+            raise ApiError(HTTPStatus.CONFLICT, "SCHEME_ACTIVE",
+                           "方案处于启用状态，请先停用再删除")
+        self.storage.delete_clock_scheme(sid)
+        self._send_json({"deleted": sid})
+
+    def _activate_scheme(self, bid: str, sid: str) -> None:
+        self.storage.require_open(bid)
+        self._get_batch_or_404(bid)
+        scheme = self._get_scheme_or_404(bid, sid)
+        if scheme["active"]:
+            return self._send_json({"scheme": _public_scheme(scheme),
+                                    "already_active": True})
+        self.storage.set_active_clock_scheme(bid, sid)
+        outcome = self._rerun_with_archiving(bid, scheme_id=sid)
+        self._send_json({
+            "scheme": _public_scheme(self.storage.get_clock_scheme(sid)),
+            "status_counts": {
+                "before": outcome["status_before"],
+                "after": _status_counts(outcome["computed"]["findings"])},
+            "archived_decisions": outcome["archived"],
+            "results_summary": outcome["computed"]["results"]["summary"]})
+
+    def _deactivate_scheme(self, bid: str, sid: str) -> None:
+        self.storage.require_open(bid)
+        self._get_batch_or_404(bid)
+        scheme = self._get_scheme_or_404(bid, sid)
+        if not scheme["active"]:
+            raise ApiError(HTTPStatus.CONFLICT, "SCHEME_NOT_ACTIVE",
+                           f"方案 {sid} 未启用")
+        self.storage.set_active_clock_scheme(bid, None)
+        outcome = self._rerun_with_archiving(bid, scheme_id=sid)
+        self._send_json({
+            "deactivated": sid,
+            "status_counts": {
+                "before": outcome["status_before"],
+                "after": _status_counts(outcome["computed"]["findings"])},
+            "archived_decisions": outcome["archived"],
+            "results_summary": outcome["computed"]["results"]["summary"]})
+
+    def _preview_scheme(self, bid: str, sid: str | None) -> None:
+        # 只读预览：批次锁定后仍可用，且不改动任何数据
+        batch = self._get_batch_or_404(bid)
+        body = self._json_body()
+        if sid is not None:
+            scheme = self._get_scheme_or_404(bid, sid)
+            offsets = scheme["offsets"]
+            if "offsets" in body:
+                offsets = self._validate_offsets(
+                    bid, body["offsets"] or {},
+                    reference_log_id=scheme["reference_log_id"])
+        else:
+            if not isinstance(body.get("offsets"), dict):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_OFFSETS",
+                               "预览需要 offsets 对象（{日志ID: 整分钟}）")
+            offsets = self._validate_offsets(bid, body["offsets"])
+        current = self._compute_results(batch)
+        preview = self._compute_results(
+            batch, offsets_override={k: v * 60 for k, v in offsets.items()})
+        decisions = self.storage.list_decisions(bid)
+        preview_ids = {f["id"] for f in preview["findings"]}
+        at_risk = [{"finding_id": fid, "resolution": d["resolution"],
+                    "reason": d["reason"]}
+                   for fid, d in sorted(decisions.items())
+                   if fid not in preview_ids]
+        self._send_json({
+            "offsets_minutes": offsets,
+            "current": {
+                "status_counts": _status_counts(current["findings"]),
+                "findings_count": len(current["findings"]),
+                "results_summary": current["results"]["summary"]},
+            "preview": {
+                "status_counts": _status_counts(preview["findings"]),
+                "findings_count": len(preview["findings"]),
+                "results_summary": preview["results"]["summary"]},
+            "scorecard_diff": _diff_scorecards(
+                current["results"]["scorecards"],
+                preview["results"]["scorecards"]),
+            "decisions_at_risk": at_risk})
+
+    def _compare_schemes(self, bid: str) -> None:
+        batch = self._get_batch_or_404(bid)
+        q = self._query()
+        if "a" not in q or "b" not in q:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "MISSING_PARAM",
+                           "需要查询参数 a=<方案ID>&b=<方案ID>")
+        sa = self._get_scheme_or_404(bid, q["a"])
+        sb = self._get_scheme_or_404(bid, q["b"])
+        ca = self._compute_results(
+            batch, offsets_override={k: v * 60
+                                     for k, v in sa["offsets"].items()})
+        cb = self._compute_results(
+            batch, offsets_override={k: v * 60
+                                     for k, v in sb["offsets"].items()})
+        self._send_json({
+            "a": {"scheme": _public_scheme(sa),
+                  "status_counts": _status_counts(ca["findings"]),
+                  "results_summary": ca["results"]["summary"]},
+            "b": {"scheme": _public_scheme(sb),
+                  "status_counts": _status_counts(cb["findings"]),
+                  "results_summary": cb["results"]["summary"]},
+            "scorecard_diff": _diff_scorecards(
+                ca["results"]["scorecards"], cb["results"]["scorecards"])})
+
+    def _list_archived(self, bid: str) -> None:
+        self._get_batch_or_404(bid)
+        archived = self.storage.list_archived_decisions(bid)
+        self._send_json({"archived_decisions": archived,
+                         "count": len(archived)})
+
+    def _dismiss_archived(self, bid: str, aid: str) -> None:
+        self.storage.require_open(bid)
+        self._get_batch_or_404(bid)
+        if not self.storage.delete_archived_decision(bid, aid):
+            raise ApiError(HTTPStatus.NOT_FOUND, "ARCHIVE_NOT_FOUND",
+                           f"归档裁决 {aid} 不存在")
+        self._send_json({"dismissed": aid})
 
     def _list_findings(self, bid: str) -> None:
         self._get_batch_or_404(bid)
@@ -668,8 +1098,16 @@ class JudgeHandler(BaseHTTPRequestHandler):
         batch = self._get_batch_or_404(bid)
         computed = self._compute_results(batch)
         decisions = self.storage.list_decisions(bid)
+        # 启用中的校正方案随版本持久化（哈希只含影响结果的内容）
+        scheme = self.storage.get_active_clock_scheme(bid)
+        scheme_slim = None
+        if scheme:
+            scheme_slim = {"reference_log_id": scheme["reference_log_id"],
+                           "max_window_seconds": scheme["max_window_seconds"],
+                           "offsets": scheme["offsets"]}
         digest = content_hash(batch["rules"], computed["findings"],
-                              decisions, computed["results"])
+                              decisions, computed["results"],
+                              clock_scheme=scheme_slim)
         # Same content as the latest version -> reproducible no-op.
         prior = self.storage.list_versions(bid)
         if prior and prior[-1]["content_hash"] == digest:
@@ -689,6 +1127,9 @@ class JudgeHandler(BaseHTTPRequestHandler):
             "decisions": decisions,
             "findings": computed["findings"],
             "results": computed["results"],
+            "clock_scheme": ({**scheme_slim, "id": scheme["id"],
+                              "name": scheme["name"]}
+                             if scheme else None),
             "created_ts": int(time.time()),
         }
         self.storage.save_version(bid, no, digest, note, snapshot)
@@ -763,8 +1204,15 @@ class JudgeHandler(BaseHTTPRequestHandler):
         batch = self._get_batch_or_404(bid)
         computed = self._compute_results(batch)
         decisions = self.storage.list_decisions(bid)
+        scheme = self.storage.get_active_clock_scheme(bid)
+        scheme_slim = None
+        if scheme:
+            scheme_slim = {"reference_log_id": scheme["reference_log_id"],
+                           "max_window_seconds": scheme["max_window_seconds"],
+                           "offsets": scheme["offsets"]}
         digest = content_hash(batch["rules"], computed["findings"],
-                              decisions, computed["results"])
+                              decisions, computed["results"],
+                              clock_scheme=scheme_slim)
         payload = {
             "export": "cabrillo-judge",
             "schema_version": 1,
@@ -779,6 +1227,12 @@ class JudgeHandler(BaseHTTPRequestHandler):
             "decisions": decisions,
             "results": computed["results"],
             "versions": self.storage.list_versions(bid),
+            "clock_schemes": [{**_public_scheme(s),
+                               "analysis": s["analysis"]}
+                              for s in self.storage.list_clock_schemes(bid)],
+            "active_clock_scheme": (_public_scheme(scheme)
+                                    if scheme else None),
+            "archived_decisions": self.storage.list_archived_decisions(bid),
             "content_hash": digest,
         }
         self._send_json(payload,
@@ -793,6 +1247,20 @@ def _public_batch(b: dict[str, Any]) -> dict[str, Any]:
     return {"id": b["id"], "name": b["name"], "rules": b["rules"],
             "locked": b["locked"], "created_ts": b["created_ts"],
             "updated_ts": b["updated_ts"]}
+
+
+def _public_scheme(s: dict[str, Any]) -> dict[str, Any]:
+    return {"id": s["id"], "name": s["name"],
+            "reference_log_id": s["reference_log_id"],
+            "max_window_seconds": s["max_window_seconds"],
+            "offsets": s["offsets"], "active": s["active"],
+            "created_ts": s["created_ts"], "updated_ts": s["updated_ts"]}
+
+
+def _refs_key(finding: dict[str, Any]) -> tuple:
+    """证据引用的稳定键（文件名:行号），与时间偏移/状态无关。"""
+    return tuple(sorted(f"{r.get('filename')}:{r.get('line')}"
+                        for r in finding.get("refs", [])))
 
 
 def _rules_digest(rules: dict[str, Any]) -> str:
@@ -874,6 +1342,20 @@ th{{background:#f7f7f7}}</style></head><body>
 <h2>接口</h2><table><tr><th>方法</th><th>路径</th><th>说明</th></tr>{rows}</table>
 <h2>配对状态</h2><ul>{statuses}</ul>
 <h2>裁决动作</h2><ul>{decisions}</ul>
+<h2>时钟偏差校正</h2>
+<ol>
+<li><code>GET /api/batches/{{id}}/clock-analysis?reference_log_id=…&amp;max_window_seconds=…</code>
+估计各日志相对参考日志的时钟偏差（中位数/离散度/样本数/覆盖时段；
+样本不足、偏差随时间变化或关系不连通时只列证据、不建议偏移）</li>
+<li><code>POST /api/batches/{{id}}/clock-schemes</code>
+建立整分钟校正方案（<code>use_suggested</code> 可采纳分析建议）</li>
+<li><code>POST …/clock-schemes/{{sid}}/preview</code>
+预览重跑配对后的状态计数与计分变化（不改动数据）</li>
+<li><code>POST …/clock-schemes/{{sid}}/activate</code>
+启用方案；每条证据同时保留原时间、校正时间与偏移</li>
+<li><code>GET …/archived-decisions</code>
+复核因方案变化失去依据而已归档的裁决（绝不静默沿用）</li>
+</ol>
 <h2>典型流程</h2>
 <ol>
 <li><code>POST /api/batches</code> 创建批次（可自定义通联分/乘数/罚分/容差）</li>
