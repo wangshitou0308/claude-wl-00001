@@ -30,7 +30,13 @@ from .engine import (
     content_hash,
     score,
 )
-from .parser import parse_cabrillo
+from .feedback import (
+    build_external_report,
+    build_station_report,
+    render_text,
+    report_content_hash,
+)
+from .parser import normalize_callsign, parse_cabrillo
 from .rules import default_rules, validate_rules
 from .storage import Storage, new_id
 
@@ -127,6 +133,25 @@ API_SPEC: dict[str, Any] = {
         {"method": "GET", "path": "/api/batches/{id}/download",
          "desc": "下载完整 JSON（规则、日志原文、证据、裁决、校正方案、"
                  "归档裁决、当前结果）"},
+        {"method": "POST", "path": "/api/batches/{id}/feedback",
+         "desc": "生成站级赛后反馈包草稿（不可变快照）。JSON: "
+                 "{version_no（必填，冻结的计分版本）, station?（省略则整批"
+                 "每台一份）, corrects?（显式指定被更正的旧包 ID）}。"
+                 "该台站已有不同版本的已发布包时自动生成更正包"},
+        {"method": "GET", "path": "/api/batches/{id}/feedback",
+         "desc": "反馈包列表。查询参数 station/status/version_no/kind"},
+        {"method": "GET", "path": "/api/batches/{id}/feedback/{rid}",
+         "desc": "反馈包详情（默认内部完整稿；?view=external 看对外脱敏稿，"
+                 "需已预览）"},
+        {"method": "POST", "path": "/api/batches/{id}/feedback/{rid}/preview",
+         "desc": "生成对外脱敏预览（草稿状态；发布前必须预览）"},
+        {"method": "POST", "path": "/api/batches/{id}/feedback/{rid}/publish",
+         "desc": "发布反馈包（需先预览；发布后不可变）"},
+        {"method": "GET", "path": "/api/batches/{id}/feedback/{rid}/download",
+         "desc": "下载反馈包。查询参数 format=json|txt、"
+                 "view=internal|external（已发布默认 external）"},
+        {"method": "GET", "path": "/api/batches/{id}/feedback/{rid}/lineage",
+         "desc": "版本追踪：该包的更正链（被谁替代、替代谁）"},
         {"method": "GET", "path": "/api/docs",
          "desc": "机器可读 API 说明（本对象）"},
     ],
@@ -164,6 +189,28 @@ API_SPEC: dict[str, Any] = {
         "archiving": "启用/停用/修改方案会重跑配对；失去依据的既有裁决自动"
                      "归档并列入待复核（GET .../archived-decisions），"
                      "绝不静默沿用；方案随计分版本快照与 content_hash 持久化",
+    },
+    "feedback": {
+        "summary": "站级赛后反馈包：以冻结的计分版本和参赛日志为输入，"
+                   "每次生成都保存为不可变快照；sqlite3 记录报告、发布状态"
+                   "与替代关系",
+        "workflow": [
+            "POST .../feedback {version_no, station?} 生成草稿"
+            "（省略 station 则整批每台一份）",
+            "GET .../feedback/{rid} 查看内部完整稿",
+            "POST .../feedback/{rid}/preview 生成对外脱敏预览",
+            "POST .../feedback/{rid}/publish 发布（须先预览，发布后不可变）",
+            "GET .../feedback/{rid}/download?format=txt 下载纯文本",
+        ],
+        "content": "逐条列出原日志行、配对状态、是否计分、QSO 分、"
+                   "新增乘数项、罚分与裁决理由，并汇总 CLAIMED-SCORE、"
+                   "最终得分与差额；无法关联原行的证据单列，不猜测归属",
+        "correction": "计分版本变化不改写已发布报告；对新版本再生成时自动"
+                      "产出注明旧包与替代版本的更正包（kind=correction），"
+                      "替代关系见 .../feedback/{rid}/lineage",
+        "redaction": "对外包（external view）不含其他台站的原始行、邮件地址"
+                     "或完整交换内容，只保留解释本台得失所需的对方呼号与"
+                     "差异项",
     },
 }
 
@@ -249,11 +296,16 @@ class JudgeHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _send_text(self, text: str, content_type: str,
-                   status: int = 200) -> None:
+                   status: int = 200,
+                   download_name: str | None = None) -> None:
         data = text.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", f"{content_type}; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        if download_name:
+            self.send_header(
+                "Content-Disposition",
+                f'attachment; filename="{download_name}"')
         self.end_headers()
         self.wfile.write(data)
 
@@ -420,6 +472,33 @@ class JudgeHandler(BaseHTTPRequestHandler):
             m = re.fullmatch(r"/api/batches/([^/]+)/lock", path)
             if m and method == "POST":
                 return self._set_lock(m.group(1))
+            # 站级赛后反馈包：字面量后缀路由先于 {rid} 通配
+            m = re.fullmatch(r"/api/batches/([^/]+)/feedback", path)
+            if m:
+                bid = m.group(1)
+                if method == "GET":
+                    return self._list_feedback(bid)
+                if method == "POST":
+                    return self._generate_feedback(bid)
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/feedback/([^/]+)/preview", path)
+            if m and method == "POST":
+                return self._preview_feedback(m.group(1), m.group(2))
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/feedback/([^/]+)/publish", path)
+            if m and method == "POST":
+                return self._publish_feedback(m.group(1), m.group(2))
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/feedback/([^/]+)/download", path)
+            if m and method == "GET":
+                return self._download_feedback(m.group(1), m.group(2))
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/feedback/([^/]+)/lineage", path)
+            if m and method == "GET":
+                return self._feedback_lineage(m.group(1), m.group(2))
+            m = re.fullmatch(r"/api/batches/([^/]+)/feedback/([^/]+)", path)
+            if m and method == "GET":
+                return self._get_feedback(m.group(1), m.group(2))
             m = re.fullmatch(r"/api/batches/([^/]+)/download", path)
             if m and method == "GET":
                 return self._download(m.group(1))
@@ -1242,6 +1321,242 @@ class JudgeHandler(BaseHTTPRequestHandler):
         self._send_json(payload,
                         download_name=f"{bid}-adjudication.json")
 
+    # -- 站级赛后反馈包 ------------------------------------------------------
+    # 输入为冻结的计分版本快照与参赛日志；生成/预览/发布均不改动批次数据，
+    # 因此批次锁定后仍可正常使用（赛后场景）。
+    def _get_feedback_or_404(self, bid: str, rid: str) -> dict[str, Any]:
+        rep = self.storage.get_feedback_report(rid)
+        if not rep or rep["batch_id"] != bid:
+            raise ApiError(HTTPStatus.NOT_FOUND, "FEEDBACK_NOT_FOUND",
+                           f"反馈包 {rid} 不存在")
+        return rep
+
+    def _generate_feedback(self, bid: str) -> None:
+        batch = self._get_batch_or_404(bid)
+        body = self._json_body()
+        if "version_no" not in body:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "MISSING_PARAM",
+                           "需要 version_no（冻结的计分版本号）作为输入")
+        try:
+            version_no = int(body["version_no"])
+        except (TypeError, ValueError) as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PARAM",
+                           "version_no 必须是整数") from exc
+        ver = self.storage.get_version(bid, version_no)
+        if not ver:
+            raise ApiError(HTTPStatus.NOT_FOUND, "VERSION_NOT_FOUND",
+                           f"计分版本 {version_no} 不存在；请先用 "
+                           f"POST /api/batches/{bid}/versions 冻结版本")
+        corrects_id = body.get("corrects")
+        station_param = body.get("station")
+        submissions = self.storage.get_submissions(bid)
+        if station_param is not None:
+            st = normalize_callsign(str(station_param))
+            if not st:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_STATION",
+                               f"台站呼号 {station_param!r} 无法归一化")
+            stations = [st]
+        else:
+            stations = sorted({s["station_call"] for s in submissions
+                               if s["station_call"]})
+            if not stations:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "NO_LOGS",
+                               "批次内还没有任何日志")
+
+        out = []
+        any_created = False
+        for st in stations:
+            logs = [s for s in submissions if s["station_call"] == st]
+            if not logs:
+                if station_param is not None:
+                    raise ApiError(HTTPStatus.NOT_FOUND, "NO_STATION_LOG",
+                                   f"台站 {st} 在本批次没有提交日志")
+                continue
+            latest_pub = self.storage.latest_published_feedback(bid, st)
+            kind, corrects = "normal", None
+            if corrects_id:
+                old = self.storage.get_feedback_report(str(corrects_id))
+                if not old or old["batch_id"] != bid:
+                    raise ApiError(HTTPStatus.NOT_FOUND,
+                                   "FEEDBACK_NOT_FOUND",
+                                   f"被更正的反馈包 {corrects_id} 不存在")
+                if old["station"] != st:
+                    raise ApiError(HTTPStatus.BAD_REQUEST,
+                                   "FEEDBACK_STATION_MISMATCH",
+                                   f"旧包 {corrects_id} 属于 {old['station']}，"
+                                   f"与目标台站 {st} 不符")
+                if old["status"] != "published":
+                    raise ApiError(HTTPStatus.CONFLICT,
+                                   "FEEDBACK_NOT_PUBLISHED",
+                                   "只能更正已发布的反馈包；草稿请直接重新生成")
+                if old["version_no"] == version_no:
+                    raise ApiError(HTTPStatus.BAD_REQUEST,
+                                   "FEEDBACK_SAME_VERSION",
+                                   "更正包须基于与旧包不同的计分版本")
+                if latest_pub and latest_pub["id"] != old["id"]:
+                    raise ApiError(
+                        HTTPStatus.CONFLICT, "FEEDBACK_CHAIN",
+                        f"只能替代该台站最新发布的包 {latest_pub['id']}，"
+                        f"以保更正链线性可追踪")
+                kind, corrects = "correction", old
+            elif latest_pub and latest_pub["version_no"] != version_no:
+                # 计分版本已演进：不改写已发布报告，自动生成注明旧包与
+                # 替代版本的更正包
+                kind, corrects = "correction", latest_pub
+
+            report = build_station_report(
+                batch=batch, version=ver, station=st, logs=logs,
+                kind=kind, corrects=corrects)
+            digest = report_content_hash(report)
+            existing = self.storage.find_feedback_by_hash(bid, st, digest)
+            if existing:
+                out.append({"report": _slim_feedback(existing),
+                            "identical_to": existing["id"]})
+                continue
+            rid = new_id("R")
+            self.storage.create_feedback_report(
+                rid, bid, st, version_no, kind,
+                corrects["id"] if corrects else None,
+                corrects["version_no"] if corrects else None,
+                digest, report)
+            if corrects:
+                # 只记录替代关系指针，旧报告内容保持不可变
+                self.storage.set_feedback_superseded(corrects["id"], rid)
+            any_created = True
+            out.append({"report": _slim_feedback(
+                self.storage.get_feedback_report(rid)), "created": True})
+
+        self._send_json({"batch_id": bid, "version_no": version_no,
+                         "reports": out, "count": len(out)},
+                        HTTPStatus.CREATED if any_created else HTTPStatus.OK)
+
+    def _list_feedback(self, bid: str) -> None:
+        self._get_batch_or_404(bid)
+        q = self._query()
+        version_no = None
+        if q.get("version_no"):
+            try:
+                version_no = int(q["version_no"])
+            except ValueError as exc:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PARAM",
+                               "version_no 必须是整数") from exc
+        status = q.get("status")
+        if status and status not in ("draft", "published"):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PARAM",
+                           "status 只能是 draft 或 published")
+        kind = q.get("kind")
+        if kind and kind not in ("normal", "correction"):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PARAM",
+                           "kind 只能是 normal 或 correction")
+        station = q.get("station")
+        if station:
+            station = normalize_callsign(station) or station.upper()
+        reports = self.storage.list_feedback_reports(
+            bid, station=station, status=status,
+            version_no=version_no, kind=kind)
+        self._send_json({"reports": reports, "count": len(reports)})
+
+    def _get_feedback(self, bid: str, rid: str) -> None:
+        self._get_batch_or_404(bid)
+        rep = self._get_feedback_or_404(bid, rid)
+        view = self._query().get("view", "internal")
+        if view == "external":
+            if not rep["external"]:
+                raise ApiError(HTTPStatus.CONFLICT, "FEEDBACK_NOT_PREVIEWED",
+                               "尚未生成对外预览：请先 POST .../preview")
+            content = rep["external"]
+        elif view == "internal":
+            content = rep["report"]
+        else:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PARAM",
+                           "view 只能是 internal 或 external")
+        self._send_json({
+            "report": _slim_feedback(rep), "view": view,
+            "lineage": {"corrects": rep["corrects_report_id"],
+                        "superseded_by": rep["superseded_by"]},
+            "content": content})
+
+    def _preview_feedback(self, bid: str, rid: str) -> None:
+        self._get_batch_or_404(bid)
+        rep = self._get_feedback_or_404(bid, rid)
+        if rep["status"] == "published":
+            raise ApiError(HTTPStatus.CONFLICT, "FEEDBACK_IMMUTABLE",
+                           "反馈包已发布，不可再变动；"
+                           "如需更新请对新计分版本生成更正包")
+        external = build_external_report(rep["report"])
+        self.storage.set_feedback_external(rid, external)
+        self._send_json({"report_id": rid, "previewed": True,
+                         "external": external})
+
+    def _publish_feedback(self, bid: str, rid: str) -> None:
+        self._get_batch_or_404(bid)
+        rep = self._get_feedback_or_404(bid, rid)
+        if rep["status"] == "published":
+            return self._send_json({"report": _slim_feedback(rep),
+                                    "already_published": True})
+        if not rep["external"]:
+            raise ApiError(HTTPStatus.CONFLICT, "FEEDBACK_NOT_PREVIEWED",
+                           "草稿预览后才能发布：请先 POST .../preview 生成并"
+                           "核对对外脱敏稿")
+        self.storage.set_feedback_published(rid)
+        self._send_json({"report": _slim_feedback(
+            self.storage.get_feedback_report(rid)), "published": True})
+
+    def _download_feedback(self, bid: str, rid: str) -> None:
+        self._get_batch_or_404(bid)
+        rep = self._get_feedback_or_404(bid, rid)
+        q = self._query()
+        view = q.get("view")
+        if view is None:
+            view = "external" if rep["status"] == "published" else "internal"
+        if view == "external":
+            if not rep["external"]:
+                raise ApiError(HTTPStatus.CONFLICT, "FEEDBACK_NOT_PREVIEWED",
+                               "尚未生成对外预览：请先 POST .../preview")
+            content = rep["external"]
+        elif view == "internal":
+            content = rep["report"]
+        else:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PARAM",
+                           "view 只能是 internal 或 external")
+        fmt = q.get("format", "json")
+        stem = f"{rep['station']}-v{rep['version_no']}-feedback-{view}"
+        if fmt == "txt":
+            return self._send_text(render_text(content), "text/plain",
+                                   download_name=f"{stem}.txt")
+        if fmt == "json":
+            return self._send_json(content, download_name=f"{stem}.json")
+        raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PARAM",
+                       "format 只能是 json 或 txt")
+
+    def _feedback_lineage(self, bid: str, rid: str) -> None:
+        self._get_batch_or_404(bid)
+        rep = self._get_feedback_or_404(bid, rid)
+        back: list[dict[str, Any]] = []
+        cur: dict[str, Any] | None = rep
+        seen: set[str] = set()
+        while cur and cur.get("corrects_report_id") \
+                and cur["corrects_report_id"] not in seen:
+            seen.add(cur["corrects_report_id"])
+            cur = self.storage.get_feedback_report(cur["corrects_report_id"])
+            if not cur or cur["batch_id"] != bid:
+                break
+            back.append(cur)
+        back.reverse()
+        fwd: list[dict[str, Any]] = []
+        cur = rep
+        seen = set()
+        while cur and cur.get("superseded_by") \
+                and cur["superseded_by"] not in seen:
+            seen.add(cur["superseded_by"])
+            cur = self.storage.get_feedback_report(cur["superseded_by"])
+            if not cur or cur["batch_id"] != bid:
+                break
+            fwd.append(cur)
+        chain = [_slim_feedback(r) for r in [*back, rep, *fwd]]
+        self._send_json({"report_id": rid, "chain": chain,
+                         "length": len(chain)})
+
 
 # ---------------------------------------------------------------------------
 # Serialisation helpers
@@ -1259,6 +1574,19 @@ def _public_scheme(s: dict[str, Any]) -> dict[str, Any]:
             "max_window_seconds": s["max_window_seconds"],
             "offsets": s["offsets"], "active": s["active"],
             "created_ts": s["created_ts"], "updated_ts": s["updated_ts"]}
+
+
+def _slim_feedback(rep: dict[str, Any]) -> dict[str, Any]:
+    """反馈包元数据（不含报告正文）。"""
+    return {"id": rep["id"], "station": rep["station"],
+            "version_no": rep["version_no"], "kind": rep["kind"],
+            "status": rep["status"], "content_hash": rep["content_hash"],
+            "corrects_report_id": rep["corrects_report_id"],
+            "corrects_version_no": rep["corrects_version_no"],
+            "superseded_by": rep["superseded_by"],
+            "previewed_ts": rep["previewed_ts"],
+            "published_ts": rep["published_ts"],
+            "created_ts": rep["created_ts"]}
 
 
 def _refs_key(finding: dict[str, Any]) -> tuple:
@@ -1359,6 +1687,20 @@ th{{background:#f7f7f7}}</style></head><body>
 启用方案；每条证据同时保留原时间、校正时间与偏移</li>
 <li><code>GET …/archived-decisions</code>
 复核因方案变化失去依据而已归档的裁决（绝不静默沿用）</li>
+</ol>
+<h2>站级赛后反馈包</h2>
+<ol>
+<li><code>POST /api/batches/{{id}}/versions?lock=1</code> 冻结计分版本</li>
+<li><code>POST /api/batches/{{id}}/feedback</code> 传
+<code>{{"version_no":1}}</code> 整批生成草稿，或加
+<code>"station":"BG1AAA"</code> 只生成单站；每次生成都是不可变快照</li>
+<li><code>GET …/feedback/{{rid}}</code> 预览内部完整稿；
+<code>POST …/feedback/{{rid}}/preview</code> 生成对外脱敏稿</li>
+<li><code>POST …/feedback/{{rid}}/publish</code> 发布（须先预览，发布后不可变）</li>
+<li>计分版本演进后再生成，自动产出注明旧包与替代版本的更正包；
+<code>GET …/feedback/{{rid}}/lineage</code> 查看更正链</li>
+<li><code>GET …/feedback/{{rid}}/download?format=txt</code> 下载纯文本
+（<code>format=json</code> 下载 JSON）</li>
 </ol>
 <h2>典型流程</h2>
 <ol>

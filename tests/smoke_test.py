@@ -548,6 +548,256 @@ with tempfile.TemporaryDirectory() as d:
     server.shutdown()
     server.server_close()
 
+# --- HTTP 层：站级赛后反馈包 ---------------------------------------------------
+from cabrillo_judge.feedback import (build_external_report,
+                                     build_station_report,
+                                     render_text, report_content_hash)
+
+with tempfile.TemporaryDirectory() as d:
+    server = make_server("127.0.0.1", 0, os.path.join(d, "t.db"))
+    port = server.server_address[1]
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+
+    def api2(method, path, body=None, raw=False):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        payload = json.dumps(body).encode() if body is not None else None
+        headers = {"Content-Type": "application/json"} if body else {}
+        conn.request(method, path, body=payload, headers=headers)
+        resp = conn.getresponse()
+        data = resp.read().decode()
+        conn.close()
+        return (resp.status, data) if raw else (resp.status, json.loads(data))
+
+    st_code, r = api2("POST", "/api/batches", {"name": "feedback-http"})
+    fbid = r["batch"]["id"]
+    st_code, r = api2("POST", f"/api/batches/{fbid}/logs", {"logs": [
+        {"filename": "BG1AAA.log", "content": DEMO_LOG_A},
+        {"filename": "BG2BBB.log", "content": DEMO_LOG_B},
+        {"filename": "BG3CCC.log", "content": DEMO_LOG_C}]})
+    check("反馈包：上传 3 份日志", st_code == 201)
+
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback",
+                      {"version_no": 1, "station": "BG1AAA"})
+    check("反馈包：无冻结版本时 404", st_code == 404
+          and r["error"] == "VERSION_NOT_FOUND", str(r)[:200])
+
+    st_code, r = api2("POST", f"/api/batches/{fbid}/versions",
+                      {"note": "v1"})
+    check("反馈包：冻结计分版本 1", st_code == 201
+          and r["version_no"] == 1, str(r)[:200])
+
+    # 单站草稿
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback",
+                      {"version_no": 1, "station": "BG1AAA"})
+    check("反馈包：单站草稿生成", st_code == 201 and r["count"] == 1
+          and r["reports"][0]["report"]["status"] == "draft"
+          and r["reports"][0]["report"]["kind"] == "normal",
+          json.dumps(r, ensure_ascii=False)[:300])
+    rid_a = r["reports"][0]["report"]["id"]
+
+    st_code, r = api2("GET", f"/api/batches/{fbid}/feedback/{rid_a}")
+    rep = r["content"]
+    check("反馈包：7 条有效行逐条列出（含原日志行）",
+          len(rep["entries"]) == 7
+          and all(e["raw"].startswith("QSO:") for e in rep["entries"]),
+          str(len(rep["entries"])))
+    check("反馈包：汇总 CLAIMED-SCORE/最终得分/差额",
+          rep["summary"]["claimed_score"] == 7
+          and rep["summary"]["final_score"] == 1
+          and rep["summary"]["difference"] == -6,
+          json.dumps(rep["summary"], ensure_ascii=False))
+    first = rep["entries"][0]
+    check("反馈包：首条计分 QSO 带 QSO 分与新增乘数项",
+          first["counted"] is True and first["qso_points"] == 1
+          and first["new_multipliers"] == [
+              {"type": "worked_call", "name": "不同对方呼号",
+               "value": "BG2BBB"}],
+          json.dumps(first, ensure_ascii=False)[:300])
+    check("反馈包：无法关联原行的证据为空且字段存在",
+          rep["unassociated_evidence"] == []
+          and rep["summary"]["lines"]["unassociated_evidence"] == 0)
+    st_code, r2 = api2("GET", f"/api/batches/{fbid}/results")
+    check("反馈包：最终得分与计分结果一致",
+          next(c for c in r2["scorecards"] if c["station"] == "BG1AAA")
+          ["total_score"] == rep["summary"]["final_score"])
+
+    # 发布前必须预览
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback/{rid_a}/publish")
+    check("反馈包：未预览不能发布", st_code == 409
+          and r["error"] == "FEEDBACK_NOT_PREVIEWED", str(r)[:200])
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback/{rid_a}/preview")
+    check("反馈包：生成对外脱敏预览", st_code == 200
+          and r["external"]["view"] == "external"
+          and r["external"]["redaction_note"], str(r)[:200])
+    ext = r["external"]
+    check("反馈包：对外稿不含其他台站原始行（无 refs）",
+          all("refs" not in e for e in ext["entries"]))
+    check("反馈包：对外稿保留本台原行与差异项",
+          all(e["raw"].startswith("QSO:") for e in ext["entries"])
+          and any(e["exchange_diffs"] for e in ext["entries"]))
+    st_code, r = api2("GET", f"/api/batches/{fbid}/feedback/{rid_a}")
+    check("反馈包：内部稿保留对方原始行（对照）",
+          any(len(e["refs"]) == 2 for e in r["content"]["entries"]))
+    st_code, r = api2("GET",
+                      f"/api/batches/{fbid}/feedback/{rid_a}?view=external")
+    check("反馈包：预览后可查对外稿", st_code == 200
+          and r["view"] == "external")
+
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback/{rid_a}/publish")
+    check("反馈包：预览后发布成功", st_code == 200
+          and r["report"]["status"] == "published", str(r)[:200])
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback/{rid_a}/preview")
+    check("反馈包：已发布不可再预览（不可变）", st_code == 409
+          and r["error"] == "FEEDBACK_IMMUTABLE", str(r)[:200])
+
+    # 整批生成：BG1AAA 内容相同幂等返回，其余两台新建草稿
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback",
+                      {"version_no": 1})
+    by_st = {x["report"]["station"]: x for x in r["reports"]}
+    check("反馈包：整批生成每台一份", st_code == 201
+          and set(by_st) == {"BG1AAA", "BG2BBB", "BG3CCC"},
+          json.dumps(r, ensure_ascii=False)[:300])
+    check("反馈包：相同内容幂等（identical_to）",
+          by_st["BG1AAA"].get("identical_to") == rid_a)
+    rid_b = by_st["BG2BBB"]["report"]["id"]
+
+    # 裁决变化 -> 冻结版本 2 -> 对已发布的 BG1AAA 自动生成更正包
+    st_code, r = api2("GET",
+                      f"/api/batches/{fbid}/findings?status=EXCHANGE_DIFF")
+    fid_ex = r["findings"][0]["id"]
+    st_code, r = api2("POST",
+                      f"/api/batches/{fbid}/findings/{fid_ex}/decision",
+                      {"resolution": "CONFIRMED", "fault_station": "BG1AAA",
+                       "penalty_code": "BAD_EXCHANGE",
+                       "reason": "BG1AAA 抄收 559，对方实发 599，判其抄错",
+                       "judge": "测试员"})
+    check("反馈包：裁决 EXCHANGE_DIFF", st_code == 200, str(r)[:200])
+    st_code, r = api2("POST", f"/api/batches/{fbid}/versions", {"note": "v2"})
+    check("反馈包：冻结计分版本 2", st_code == 201
+          and r["version_no"] == 2, str(r)[:200])
+
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback",
+                      {"version_no": 2, "station": "BG1AAA"})
+    rep2meta = r["reports"][0]["report"]
+    check("反馈包：版本演进自动生成更正包",
+          rep2meta["kind"] == "correction"
+          and rep2meta["corrects_report_id"] == rid_a,
+          json.dumps(rep2meta, ensure_ascii=False))
+    rid_a2 = rep2meta["id"]
+    st_code, r = api2("GET", f"/api/batches/{fbid}/feedback/{rid_a2}")
+    rep2 = r["content"]
+    check("反馈包：更正包注明旧包与替代版本",
+          rep2["correction"]["supersedes_report_id"] == rid_a
+          and rep2["correction"]["supersedes_version_no"] == 1
+          and rep2["correction"]["previous_final_score"] == 1
+          and rep2["correction"]["score_delta"] == -1,
+          json.dumps(rep2["correction"], ensure_ascii=False))
+    check("反馈包：更正包反映新裁决（第14行计分且罚 2 分）",
+          rep2["summary"]["final_score"] == 0
+          and rep2["summary"]["penalty_points"] == 2
+          and any(e["line"] == 14 and e["counted"]
+                  and e["penalty_points"] == 2
+                  and e["decision"]["resolution"] == "CONFIRMED"
+                  for e in rep2["entries"]),
+          json.dumps(rep2["summary"], ensure_ascii=False))
+    st_code, r = api2("GET", f"/api/batches/{fbid}/feedback/{rid_a}")
+    check("反馈包：旧包不被改写且记录替代关系",
+          r["report"]["status"] == "published"
+          and r["report"]["superseded_by"] == rid_a2
+          and r["content"]["summary"]["final_score"] == 1)
+    st_code, r = api2("GET",
+                      f"/api/batches/{fbid}/feedback/{rid_a2}/lineage")
+    check("反馈包：更正链可追踪（长度 2）",
+          r["length"] == 2
+          and [c["id"] for c in r["chain"]] == [rid_a, rid_a2],
+          json.dumps(r, ensure_ascii=False)[:300])
+
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback",
+                      {"version_no": 2, "station": "BG2BBB"})
+    check("反馈包：无已发布旧包时新版本仍为普通包",
+          r["reports"][0]["report"]["kind"] == "normal")
+
+    # 显式 corrects 校验
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback",
+                      {"version_no": 2, "station": "BG3CCC",
+                       "corrects": rid_b})
+    check("反馈包：不能更正其他台站的包", st_code == 400
+          and r["error"] == "FEEDBACK_STATION_MISMATCH", str(r)[:200])
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback",
+                      {"version_no": 2, "station": "BG2BBB",
+                       "corrects": rid_b})
+    check("反馈包：草稿不能被更正（须已发布）", st_code == 409
+          and r["error"] == "FEEDBACK_NOT_PUBLISHED", str(r)[:200])
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback",
+                      {"version_no": 1, "station": "BG1AAA",
+                       "corrects": rid_a})
+    check("反馈包：更正包须基于不同版本", st_code == 400
+          and r["error"] == "FEEDBACK_SAME_VERSION", str(r)[:200])
+
+    # 下载：已发布默认对外稿；纯文本含汇总且不含对方原行
+    st_code, txt = api2("GET", f"/api/batches/{fbid}/feedback/{rid_a}"
+                               f"/download?format=txt", raw=True)
+    check("反馈包：纯文本下载（默认对外）",
+          st_code == 200 and "CLAIMED-SCORE" in txt
+          and "对方原行" not in txt and "脱敏说明" in txt, txt[:160])
+    st_code, txt = api2("GET", f"/api/batches/{fbid}/feedback/{rid_a}"
+                               f"/download?format=txt&view=internal",
+                        raw=True)
+    check("反馈包：内部稿纯文本含对方原行",
+          st_code == 200 and "对方原行" in txt, txt[:160])
+    st_code, r = api2("GET", f"/api/batches/{fbid}/feedback/{rid_a}"
+                             f"/download?format=json")
+    check("反馈包：JSON 下载默认对外视图",
+          st_code == 200 and r["view"] == "external"
+          and all("refs" not in e for e in r["entries"]))
+    st_code, r = api2("GET", f"/api/batches/{fbid}/feedback"
+                             f"?station=BG1AAA&kind=correction")
+    check("反馈包：列表过滤（更正包）", st_code == 200
+          and r["count"] == 1
+          and r["reports"][0]["id"] == rid_a2, str(r)[:200])
+
+    server.shutdown()
+    server.server_close()
+
+# --- 反馈包：无法关联原行的证据单列（单元级） -------------------------------------
+fake_version = {"version_no": 9, "content_hash": "x" * 64, "created_ts": 1,
+                "snapshot": {
+                    "rules": rules,
+                    "findings": [{
+                        "id": "F-unrel", "status": "MATCH", "pending": False,
+                        "band": "40m", "mode": "CW", "ts_hint": 0,
+                        "stations": ["BG1AAA", "BG9ZZZ"],
+                        "refs": [{"log_id": "L-else", "filename": "else.log",
+                                  "station": "BG9ZZZ", "line": 3,
+                                  "raw": "QSO: 7023 CW ..."}],
+                        "effects": {}, "auto_reason": "测试证据",
+                        "exchange_diffs": [], "call_detail": {},
+                        "decision": None}],
+                    "results": {"scorecards": [], "summary": {}},
+                    "decisions": {}}}
+rep_u = build_station_report(
+    batch={"id": "B-u", "name": "单测"}, version=fake_version,
+    station="BG1AAA",
+    logs=[{"log_id": "L1", "filename": "BG1AAA.log",
+           "station_call": "BG1AAA", "upload_ts": 1, "parsed": pa}])
+check("无法关联原行的证据单列、不猜测归属",
+      [u["finding_id"] for u in rep_u["unassociated_evidence"]] == ["F-unrel"]
+      and "不猜测归属" in rep_u["unassociated_evidence"][0]["note"],
+      json.dumps(rep_u["unassociated_evidence"], ensure_ascii=False))
+check("无证据的合法行标 UNTRACKED 而不猜测配对",
+      all(e["status"] == "UNTRACKED" for e in rep_u["entries"]))
+ext_u = build_external_report(rep_u)
+check("对外包剔除 refs 且标注脱敏",
+      all("refs" not in e for e in ext_u["entries"])
+      and ext_u["redaction_note"])
+txt_u = render_text(ext_u)
+check("纯文本渲染包含无法关联证据段",
+      "无法关联原日志行的证据" in txt_u and "F-unrel" in txt_u)
+check("报告内容哈希稳定（幂等）",
+      report_content_hash(rep_u) == report_content_hash(
+          json.loads(json.dumps(rep_u))))
+
 print()
 if failures:
     print(f"{len(failures)} 项失败:", failures)

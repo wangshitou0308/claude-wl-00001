@@ -86,6 +86,25 @@ CREATE TABLE IF NOT EXISTS decision_archive (
     archived_ts    INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS feedback_reports (
+    -- 站级赛后反馈包：每次生成都是不可变快照；发布状态与替代关系在此记录
+    id                  TEXT PRIMARY KEY,
+    batch_id            TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    station_call        TEXT NOT NULL,
+    version_no          INTEGER NOT NULL,
+    kind                TEXT NOT NULL DEFAULT 'normal',
+    status              TEXT NOT NULL DEFAULT 'draft',
+    content_hash        TEXT NOT NULL,
+    corrects_report_id  TEXT,
+    corrects_version_no INTEGER,
+    superseded_by       TEXT,
+    report_json         TEXT NOT NULL,
+    external_json       TEXT,
+    previewed_ts        INTEGER,
+    published_ts        INTEGER,
+    created_ts          INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS api_keys (
     -- placeholder table for future offline tokens; unused today
     key TEXT PRIMARY KEY
@@ -478,3 +497,113 @@ class Storage:
                 (batch_id, archive_id))
             self.conn.commit()
             return cur.rowcount > 0
+
+    # -- feedback reports (站级赛后反馈包) ----------------------------------
+    def create_feedback_report(self, report_id: str, batch_id: str,
+                               station: str, version_no: int, kind: str,
+                               corrects_report_id: str | None,
+                               corrects_version_no: int | None,
+                               content_hash: str,
+                               report: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO feedback_reports (id, batch_id, station_call, "
+                "version_no, kind, status, content_hash, corrects_report_id, "
+                "corrects_version_no, report_json, created_ts) "
+                "VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?)",
+                (report_id, batch_id, station, int(version_no), kind,
+                 content_hash, corrects_report_id, corrects_version_no,
+                 json.dumps(report, ensure_ascii=False), _now()))
+            self.conn.commit()
+        return self.get_feedback_report(report_id)
+
+    @staticmethod
+    def _feedback_row(row: sqlite3.Row,
+                      with_payload: bool = True) -> dict[str, Any]:
+        out = {"id": row["id"], "batch_id": row["batch_id"],
+               "station": row["station_call"],
+               "version_no": row["version_no"], "kind": row["kind"],
+               "status": row["status"], "content_hash": row["content_hash"],
+               "corrects_report_id": row["corrects_report_id"],
+               "corrects_version_no": row["corrects_version_no"],
+               "superseded_by": row["superseded_by"],
+               "previewed_ts": row["previewed_ts"],
+               "published_ts": row["published_ts"],
+               "created_ts": row["created_ts"]}
+        if with_payload:
+            out["report"] = json.loads(row["report_json"])
+            out["external"] = (json.loads(row["external_json"])
+                               if row["external_json"] else None)
+        return out
+
+    def get_feedback_report(self, report_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM feedback_reports WHERE id = ?",
+            (report_id,)).fetchone()
+        return self._feedback_row(row) if row else None
+
+    def list_feedback_reports(self, batch_id: str,
+                              station: str | None = None,
+                              status: str | None = None,
+                              version_no: int | None = None,
+                              kind: str | None = None
+                              ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM feedback_reports WHERE batch_id = ?"
+        args: list[Any] = [batch_id]
+        if station:
+            sql += " AND station_call = ?"
+            args.append(station)
+        if status:
+            sql += " AND status = ?"
+            args.append(status)
+        if version_no is not None:
+            sql += " AND version_no = ?"
+            args.append(int(version_no))
+        if kind:
+            sql += " AND kind = ?"
+            args.append(kind)
+        sql += " ORDER BY created_ts, id"
+        rows = self.conn.execute(sql, args).fetchall()
+        return [self._feedback_row(r, with_payload=False) for r in rows]
+
+    def find_feedback_by_hash(self, batch_id: str, station: str,
+                              content_hash: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM feedback_reports WHERE batch_id = ? AND "
+            "station_call = ? AND content_hash = ? ORDER BY created_ts",
+            (batch_id, station, content_hash)).fetchone()
+        return self._feedback_row(row) if row else None
+
+    def latest_published_feedback(self, batch_id: str,
+                                  station: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM feedback_reports WHERE batch_id = ? AND "
+            "station_call = ? AND status = 'published' "
+            "ORDER BY published_ts DESC, created_ts DESC LIMIT 1",
+            (batch_id, station)).fetchone()
+        return self._feedback_row(row) if row else None
+
+    def set_feedback_external(self, report_id: str,
+                              external: dict[str, Any]) -> None:
+        with self._lock:
+            self.conn.execute(
+                "UPDATE feedback_reports SET external_json = ?, "
+                "previewed_ts = ? WHERE id = ?",
+                (json.dumps(external, ensure_ascii=False), _now(),
+                 report_id))
+            self.conn.commit()
+
+    def set_feedback_published(self, report_id: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                "UPDATE feedback_reports SET status = 'published', "
+                "published_ts = ? WHERE id = ?", (_now(), report_id))
+            self.conn.commit()
+
+    def set_feedback_superseded(self, old_id: str, new_id_: str) -> None:
+        """记录替代关系（只写元数据指针，不改写旧报告内容）。"""
+        with self._lock:
+            self.conn.execute(
+                "UPDATE feedback_reports SET superseded_by = ? WHERE id = ?",
+                (new_id_, old_id))
+            self.conn.commit()

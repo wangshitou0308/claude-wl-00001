@@ -12,6 +12,7 @@
 ```bash
 # 启动并自动创建两个示例赛事：
 #   1) 3 份日志，覆盖全部 7 种配对状态
+#      （另冻结计分版本 1 并生成站级赛后反馈包：BG1AAA 已发布，其余为草稿）
 #   2) 4 份日志的时钟偏差示例（快 6 分钟 / 慢 8 分钟 / 样本不足）
 python3 -m cabrillo_judge --reset-demo --demo --port 8080
 
@@ -171,6 +172,56 @@ curl -s $B/api/batches/$BID/archived-decisions                     # 待复核�
 - 启用中的方案随计分版本快照与 `content_hash` 持久化；
   `GET .../download` 的完整 JSON 包含全部方案与归档裁决。
 
+## 站级赛后反馈包
+
+赛后以**冻结的计分版本**和参赛日志为输入，为每个台站生成反馈包；
+每次生成都保存为**不可变快照**，报告、发布状态与替代关系均由 sqlite3
+记录。报告逐条列出本台**原日志行、配对状态、是否计分、QSO 分、
+新增乘数项、罚分和裁决理由**，并汇总 **CLAIMED-SCORE、最终得分与差额**；
+无法关联本台原日志行的证据单列于 `unassociated_evidence`，**不猜测归属**。
+
+```bash
+B=http://127.0.0.1:8080
+
+# 1. 先冻结计分版本（反馈包只接受冻结版本作为输入）
+curl -s -X POST "$B/api/batches/$BID/versions?lock=1" \
+  -H 'Content-Type: application/json' -d '{"note":"终版"}'
+
+# 2. 生成草稿：整批每台一份（省略 station），或只生成单站
+curl -s -X POST $B/api/batches/$BID/feedback \
+  -H 'Content-Type: application/json' -d '{"version_no":1}'
+curl -s -X POST $B/api/batches/$BID/feedback \
+  -H 'Content-Type: application/json' -d '{"version_no":1,"station":"BG1AAA"}'
+
+# 3. 预览：先看内部完整稿，再生成对外脱敏稿（发布前必须预览）
+curl -s $B/api/batches/$BID/feedback/$RID
+curl -s -X POST $B/api/batches/$BID/feedback/$RID/preview
+
+# 4. 发布（发布后不可变）；下载 JSON 或纯文本
+curl -s -X POST $B/api/batches/$BID/feedback/$RID/publish
+curl -s "$B/api/batches/$BID/feedback/$RID/download?format=txt" -o BG1AAA.txt
+curl -s "$B/api/batches/$BID/feedback/$RID/download?format=json" -o BG1AAA.json
+
+# 5. 计分版本演进后：已发布报告不被改写，再生成时自动产出
+#    注明旧包与替代版本的更正包（kind=correction）
+curl -s -X POST $B/api/batches/$BID/feedback \
+  -H 'Content-Type: application/json' -d '{"version_no":2,"station":"BG1AAA"}'
+curl -s $B/api/batches/$BID/feedback/$RID2/lineage   # 更正链追踪
+```
+
+要点：
+
+- **不可变与幂等**：报告内容哈希相同则返回既有包（`identical_to`），
+  不重复建包；已发布的包不能再预览/改动。
+- **更正包**：只能更正**已发布**的包，且须基于**不同**的计分版本、
+  沿该台站最新发布包线性链接；旧包只记录 `superseded_by` 指针，
+  内容保持原样。
+- **对外脱敏**（`view=external`，发布与整批分发的默认视图）：不含其他
+  台站的原始行、邮件地址或完整交换内容，只保留解释本台得失所需的
+  **对方呼号和差异项**（字段级的"抄收 vs 对方实发"）；本台自己的原始
+  行完整保留。内部稿（`view=internal`）保留双方原始行供裁判核对。
+- 生成/预览/发布不改动批次数据，批次锁定后照常可用。
+
 ## 规则配置（可配置通联分、乘数、罚分）
 
 `POST /api/batches` 的 `rules` 字段（或 `PUT .../rules`）接受完整/部分规则对象，
@@ -253,6 +304,12 @@ QSO 数、乘数、罚分、总分的 a/b 差值及新增/变更的裁决。
 | POST | `/api/batches/{id}/clock-schemes/preview` | 临时偏移预览 |
 | GET | `/api/batches/{id}/clock-schemes/compare?a=&b=` | 比较两个方案 |
 | GET/DELETE | `/api/batches/{id}/archived-decisions[/{aid}]` | 待复核归档裁决列表/复核后移除 |
+| POST/GET | `/api/batches/{id}/feedback` | 生成反馈包草稿（`{version_no, station?, corrects?}`；省略 station 整批每台一份）/列表（`station/status/version_no/kind` 过滤） |
+| GET | `/api/batches/{id}/feedback/{rid}` | 反馈包详情（`?view=external` 看对外脱敏稿） |
+| POST | `/api/batches/{id}/feedback/{rid}/preview` | 生成对外脱敏预览（发布前必须） |
+| POST | `/api/batches/{id}/feedback/{rid}/publish` | 发布反馈包（不可变） |
+| GET | `/api/batches/{id}/feedback/{rid}/download` | 下载（`format=json\|txt`、`view=internal\|external`） |
+| GET | `/api/batches/{id}/feedback/{rid}/lineage` | 更正链版本追踪 |
 | GET | `/api/batches/{id}/download` | 完整 JSON 下载 |
 
 ## 测试
@@ -262,7 +319,9 @@ python3 tests/smoke_test.py
 ```
 
 覆盖：必填头/POWER 类别默认值、前缀式便携呼号、普通头不再抛 `TypeError`、
-七种配对状态、计分聚合与存储层往返。
+七种配对状态、计分聚合与存储层往返、时钟偏差分析与校正方案、
+站级反馈包（冻结版本输入、逐条明细与汇总、预览-发布门控、对外脱敏、
+更正包与更正链、JSON/纯文本下载、无法关联证据单列）。
 
 ## 安全说明
 

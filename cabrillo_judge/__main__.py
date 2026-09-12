@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 
 from .parser import parse_cabrillo
 from .rules import default_rules
@@ -201,6 +202,49 @@ def seed_clock_demo(storage: Storage) -> str:
     return bid
 
 
+def seed_feedback_demo(storage: Storage, bid: str) -> bool:
+    """为示例赛事冻结计分版本 1 并生成站级赛后反馈包示例。
+
+    每台一份草稿；BG1AAA 的包走完整流程（预览 -> 发布）作为示范。
+    已存在版本时跳过（幂等）。
+    """
+    if storage.list_versions(bid):
+        return False
+    from .engine import adjudicate, apply_decisions, content_hash, score
+    from .feedback import (build_external_report, build_station_report,
+                           report_content_hash)
+    batch = storage.get_batch(bid)
+    submissions = storage.get_submissions(bid)
+    raw = adjudicate(batch["rules"], submissions)["findings"]
+    decisions = storage.list_decisions(bid)
+    annotated = apply_decisions(batch["rules"], raw, decisions)
+    results = score(batch["rules"], annotated)
+    digest = content_hash(batch["rules"], annotated, decisions, results)
+    snapshot = {
+        "batch_id": bid, "version_no": 1, "content_hash": digest,
+        "batch_name": batch["name"], "rules": batch["rules"],
+        "decisions": decisions, "findings": annotated,
+        "results": results, "clock_scheme": None,
+        "created_ts": int(time.time()),
+    }
+    storage.save_version(bid, 1, digest, "示例冻结版本（反馈包演示）", snapshot)
+    version = storage.get_version(bid, 1)
+    for st in sorted({s["station_call"] for s in submissions
+                      if s["station_call"]}):
+        logs = [s for s in submissions if s["station_call"] == st]
+        report = build_station_report(batch=batch, version=version,
+                                      station=st, logs=logs)
+        rid = new_id("R")
+        storage.create_feedback_report(
+            rid, bid, st, 1, "normal", None, None,
+            report_content_hash(report), report)
+        if st == "BG1AAA":
+            storage.set_feedback_external(
+                rid, build_external_report(report))
+            storage.set_feedback_published(rid)
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="python -m cabrillo_judge",
@@ -222,9 +266,11 @@ def main(argv: list[str] | None = None) -> int:
     server = make_server(args.host, args.port, args.db)
     bid = None
     skew_bid = None
+    feedback_seeded = False
     if args.demo or args.reset_demo:
         bid = seed_demo(server.storage, reset=args.reset_demo)  # type: ignore[attr-defined]
         skew_bid = seed_clock_demo(server.storage)  # type: ignore[attr-defined]
+        feedback_seeded = seed_feedback_demo(server.storage, bid)  # type: ignore[attr-defined]
 
     print("=" * 64)
     print(f"{DOC_TITLE}")
@@ -234,6 +280,11 @@ def main(argv: list[str] | None = None) -> int:
     if bid:
         print(f"示例赛事  : 批次 {bid}")
         print(f"  GET http://{args.host}:{args.port}/api/batches/{bid}/disputes")
+        print(f"站级反馈包示例: GET http://{args.host}:{args.port}"
+              f"/api/batches/{bid}/feedback")
+        if feedback_seeded:
+            print("  （已冻结计分版本 1；BG1AAA 的反馈包已预览并发布，"
+                  "其余为草稿）")
     if skew_bid:
         print(f"时钟偏差示例: 批次 {skew_bid}")
         print(f"  GET http://{args.host}:{args.port}/api/batches/{skew_bid}"
