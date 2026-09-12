@@ -10,6 +10,9 @@
 * 偏差随时间变化（前后半程中位数之差超过 ``drift_threshold_seconds``）；
 * 日志关系图不与参考日志连通（批次内没有可串联的互指候选对）。
 
+只经中间日志间接连通的日志，其中位数与离散度由沿途各段样本的
+逐跳累计分布（笛卡尔和，超限后确定性等距抽样）给出。
+
 分析只读取解析结果，绝不修改原始 Cabrillo 文本或时间。
 """
 
@@ -24,6 +27,8 @@ from typing import Any
 DEFAULT_MIN_SAMPLES = 3
 DEFAULT_DRIFT_THRESHOLD_SECONDS = 60
 DEFAULT_MAX_MAD_SECONDS = 90
+# 多跳路径累计偏差样本的上限（超出后确定性等距抽样，防止组合爆炸）
+MAX_COMBINED_SAMPLES = 4096
 
 
 def _iso(ts: int) -> str:
@@ -160,6 +165,14 @@ def _merge_coverage(coverages: list[dict[str, Any] | None]
             "span_seconds": _iso_to_ts(last) - _iso_to_ts(first)}
 
 
+def _downsample_sorted(values: list[float], cap: int) -> list[float]:
+    """确定性等距抽样，把有序样本压到 *cap* 以内。"""
+    if len(values) <= cap:
+        return values
+    step = len(values) / cap
+    return [values[int(i * step)] for i in range(cap)]
+
+
 def analyze_clock_skew(submissions: list[dict[str, Any]],
                        reference_log_id: str,
                        max_window_seconds: int,
@@ -215,7 +228,9 @@ def analyze_clock_skew(submissions: list[dict[str, Any]],
             adj[sa["log_id"]].append((sb["log_id"], med, rep))
             adj[sb["log_id"]].append((sa["log_id"], -med, rep))
 
-    # 2) 从参考日志沿候选对图 BFS，累计估计偏差（ts_log − ts_ref）。
+    # 2) 从参考日志沿候选对图 BFS，逐跳累计偏差样本（笛卡尔和），
+    #    得到 ts_log − ts_ref 的样本分布；中位数即估计偏差。
+    acc: dict[str, list[float]] = {ref["log_id"]: [0.0]}
     est: dict[str, float] = {ref["log_id"]: 0.0}
     paths: dict[str, list[dict[str, Any]]] = {ref["log_id"]: []}
     queue = [ref["log_id"]]
@@ -224,7 +239,15 @@ def analyze_clock_skew(submissions: list[dict[str, Any]],
         for nxt, signed, rep in adj.get(cur, []):
             if nxt in est:
                 continue
-            est[nxt] = est[cur] + signed
+            hop_deltas = [e["delta_seconds"] for e in rep["evidence"]]
+            if rep["a"]["log_id"] != cur:      # 反向遍历：样本取负
+                hop_deltas = [-d for d in hop_deltas]
+            combined = [x + d for x in acc[cur] for d in hop_deltas]
+            if len(combined) > MAX_COMBINED_SAMPLES:
+                combined = _downsample_sorted(sorted(combined),
+                                              MAX_COMBINED_SAMPLES)
+            acc[nxt] = combined
+            est[nxt] = statistics.median(combined)
             paths[nxt] = paths[cur] + [{
                 "from": cur, "to": nxt,
                 "from_station": by_id[cur]["station_call"],
@@ -274,13 +297,14 @@ def analyze_clock_skew(submissions: list[dict[str, Any]],
             hops = paths[lid]
             reasons = [f"{h['from_station']}↔{h['to_station']}：{p}"
                        for h in hops for p in h["problems"]]
+            # 中位数/离散度来自逐跳累计的偏差样本分布（单跳时即该段样本）
+            med = est[lid]
+            mad = statistics.median([abs(x - med) for x in acc[lid]])
             entry.update({
                 "connected": True, "path": hops,
-                "estimated_skew_seconds": est[lid],
-                "median_seconds": (hops[0]["median_seconds"]
-                                   if len(hops) == 1 else None),
-                "mad_seconds": (hops[0]["mad_seconds"]
-                                if len(hops) == 1 else None),
+                "estimated_skew_seconds": med,
+                "median_seconds": med,
+                "mad_seconds": mad,
                 "sample_count": sum(h["sample_count"] for h in hops),
                 "coverage": _merge_coverage([h["coverage"] for h in hops]),
                 "drift_detected": any(h["drift_detected"] for h in hops),
@@ -288,7 +312,7 @@ def analyze_clock_skew(submissions: list[dict[str, Any]],
                 "suggested_offset_minutes": None,
             })
             if not reasons:
-                suggested = _round_minutes(-est[lid])
+                suggested = _round_minutes(-med)
                 entry["suggested_offset_minutes"] = suggested
                 suggestions[lid] = suggested
         logs.append(entry)

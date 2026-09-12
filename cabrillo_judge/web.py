@@ -803,6 +803,10 @@ class JudgeHandler(BaseHTTPRequestHandler):
         if body.get("activate"):
             self.storage.set_active_clock_scheme(bid, sid)
             outcome = self._rerun_with_archiving(bid, scheme_id=sid)
+            # 重新读取持久化后的方案，避免把创建时的 active=False 旧快照
+            # 返回给客户端
+            resp["scheme"] = _public_scheme(
+                self.storage.get_clock_scheme(sid))
             resp["activated"] = True
             resp["status_counts"] = {
                 "before": outcome["status_before"],

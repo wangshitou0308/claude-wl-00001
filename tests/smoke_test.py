@@ -281,6 +281,68 @@ check("关系不连通的日志只列证据不建议",
       and any("不连通" in r for r in ll["suppress_reasons"]),
       json.dumps(ll, ensure_ascii=False))
 
+# 两跳关系（参考->中间->末端）：末端日志也要有中位数与离散度
+TWOHOP_REF = """START-OF-LOG: 3.0
+CALLSIGN: BG1AAA
+CONTEST: DEMO-CW
+CATEGORY-MODE: CW
+CATEGORY-BANDS: ALL
+CATEGORY-OPERATOR: SINGLE-OP
+CATEGORY-POWER: LOW
+QSO: 7023 CW 2026-09-10 0100 BG1AAA 599 001 BG2MMM 599 001
+QSO: 7023 CW 2026-09-10 0140 BG1AAA 599 002 BG2MMM 599 002
+QSO: 7023 CW 2026-09-10 0220 BG1AAA 599 003 BG2MMM 599 003
+END-OF-LOG:
+"""
+TWOHOP_MID = """START-OF-LOG: 3.0
+CALLSIGN: BG2MMM
+CONTEST: DEMO-CW
+CATEGORY-MODE: CW
+CATEGORY-BANDS: ALL
+CATEGORY-OPERATOR: SINGLE-OP
+CATEGORY-POWER: LOW
+QSO: 7023 CW 2026-09-10 0103 BG2MMM 599 001 BG1AAA 599 001
+QSO: 7023 CW 2026-09-10 0144 BG2MMM 599 002 BG1AAA 599 002
+QSO: 7023 CW 2026-09-10 0225 BG2MMM 599 003 BG1AAA 599 003
+QSO: 7023 CW 2026-09-10 0110 BG2MMM 599 004 BG3EEE 599 001
+QSO: 7023 CW 2026-09-10 0150 BG2MMM 599 005 BG3EEE 599 002
+QSO: 7023 CW 2026-09-10 0230 BG2MMM 599 006 BG3EEE 599 003
+END-OF-LOG:
+"""
+TWOHOP_END = """START-OF-LOG: 3.0
+CALLSIGN: BG3EEE
+CONTEST: DEMO-CW
+CATEGORY-MODE: CW
+CATEGORY-BANDS: ALL
+CATEGORY-OPERATOR: SINGLE-OP
+CATEGORY-POWER: LOW
+QSO: 7023 CW 2026-09-10 0114 BG3EEE 599 001 BG2MMM 599 004
+QSO: 7023 CW 2026-09-10 0154 BG3EEE 599 002 BG2MMM 599 005
+QSO: 7023 CW 2026-09-10 0234 BG3EEE 599 003 BG2MMM 599 006
+END-OF-LOG:
+"""
+t_subs = [_sub("TR", "twohop-ref.log", TWOHOP_REF, rules),
+          _sub("TM", "twohop-mid.log", TWOHOP_MID, rules),
+          _sub("TE", "twohop-end.log", TWOHOP_END, rules)]
+trep = analyze_clock_skew(t_subs, "TR", 1800)
+tm = next(l for l in trep["logs"] if l["log_id"] == "TM")
+te = next(l for l in trep["logs"] if l["log_id"] == "TE")
+check("中间日志直连：中位数 240 秒、MAD 60 秒、建议 -4 分钟",
+      tm["median_seconds"] == 240 and tm["mad_seconds"] == 60
+      and tm["suggested_offset_minutes"] == -4,
+      json.dumps(tm, ensure_ascii=False))
+check("两跳末端日志连通且路径长为 2、累计 6 个样本",
+      te["connected"] and len(te["path"]) == 2
+      and te["sample_count"] == 6,
+      json.dumps(te, ensure_ascii=False))
+check("两跳末端日志给出累计中位数与离散度（不再为 null）",
+      te["median_seconds"] == 480 and te["mad_seconds"] == 60,
+      json.dumps(te, ensure_ascii=False))
+check("两跳末端日志建议 -8 分钟",
+      te["suggested_offset_minutes"] == -8
+      and trep["suggested_offsets_minutes"].get("TE") == -8,
+      str(trep["suggested_offsets_minutes"]))
+
 # --- 引擎时间偏移：校正后配对与证据字段 ---------------------------------------
 res_raw = adjudicate(rules, s_subs)
 st_raw = sorted(f["status"] for f in res_raw["findings"])
@@ -399,6 +461,9 @@ with tempfile.TemporaryDirectory() as d:
     check("HTTP 创建并启用方案", st_code == 201
           and r["scheme"]["offsets"].get(lids["BG2BBB"]) == -6
           and r["scheme"]["offsets"].get(lids["BG3CCC"]) == 8,
+          json.dumps(r.get("scheme"), ensure_ascii=False))
+    check("创建并启用时响应中的方案状态与持久化一致（active=true）",
+          r.get("activated") is True and r["scheme"]["active"] is True,
           json.dumps(r.get("scheme"), ensure_ascii=False))
     sid = r["scheme"]["id"]
     check("启用后 TIME_DRIFT 全部转为 MATCH",
