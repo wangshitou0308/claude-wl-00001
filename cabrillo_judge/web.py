@@ -35,6 +35,7 @@ from .feedback import (
     build_station_report,
     render_text,
     report_content_hash,
+    version_bound_logs,
 )
 from .parser import normalize_callsign, parse_cabrillo
 from .rules import default_rules, validate_rules
@@ -208,9 +209,12 @@ API_SPEC: dict[str, Any] = {
         "correction": "计分版本变化不改写已发布报告；对新版本再生成时自动"
                       "产出注明旧包与替代版本的更正包（kind=correction），"
                       "替代关系见 .../feedback/{rid}/lineage",
+        "log_binding": "版本快照内含冻结当时的日志清单（logs）；旧版本报告"
+                       "只取清单内的日志，冻结后上传的日志不得混入",
         "redaction": "对外包（external view）不含其他台站的原始行、邮件地址"
                      "或完整交换内容，只保留解释本台得失所需的对方呼号与"
-                     "差异项",
+                     "差异项；裁决理由等自由文本中的邮件地址与他台 QSO "
+                     "原文一律隐去（本台自己的原日志行保留）",
     },
 }
 
@@ -1204,12 +1208,19 @@ class JudgeHandler(BaseHTTPRequestHandler):
         if self.headers.get("Content-Type", "").startswith("application/json"):
             body = self._json_body()
             note = str(body.get("note") or "") or None
+        # 冻结时在场的日志清单随快照持久化：旧版本的反馈包只取这些日志，
+        # 冻结后上传的日志不得混入（版本-日志绑定）
+        log_manifest = [
+            {"log_id": s["log_id"], "filename": s["filename"],
+             "station_call": s["station_call"], "upload_ts": s["upload_ts"]}
+            for s in self.storage.get_submissions(bid)]
         snapshot = {
             "batch_id": bid, "version_no": no, "content_hash": digest,
             "batch_name": batch["name"], "rules": batch["rules"],
             "decisions": decisions,
             "findings": computed["findings"],
             "results": computed["results"],
+            "logs": log_manifest,
             "clock_scheme": ({**scheme_slim, "id": scheme["id"],
                               "name": scheme["name"]}
                              if scheme else None),
@@ -1350,6 +1361,9 @@ class JudgeHandler(BaseHTTPRequestHandler):
         corrects_id = body.get("corrects")
         station_param = body.get("station")
         submissions = self.storage.get_submissions(bid)
+        # 版本-日志绑定：旧版本的报告只取冻结当时的日志，
+        # 冻结之后上传的日志不得混入
+        bound = version_bound_logs(ver, submissions)
         if station_param is not None:
             st = normalize_callsign(str(station_param))
             if not st:
@@ -1357,18 +1371,28 @@ class JudgeHandler(BaseHTTPRequestHandler):
                                f"台站呼号 {station_param!r} 无法归一化")
             stations = [st]
         else:
-            stations = sorted({s["station_call"] for s in submissions
+            stations = sorted({s["station_call"] for s in bound
                                if s["station_call"]})
             if not stations:
+                if submissions:
+                    raise ApiError(
+                        HTTPStatus.BAD_REQUEST, "NO_LOGS",
+                        f"计分版本 v{version_no} 冻结时批次内没有日志；"
+                        f"之后上传的日志不参与旧版本反馈包")
                 raise ApiError(HTTPStatus.BAD_REQUEST, "NO_LOGS",
                                "批次内还没有任何日志")
 
         out = []
         any_created = False
         for st in stations:
-            logs = [s for s in submissions if s["station_call"] == st]
+            logs = [s for s in bound if s["station_call"] == st]
             if not logs:
                 if station_param is not None:
+                    if any(s["station_call"] == st for s in submissions):
+                        raise ApiError(
+                            HTTPStatus.NOT_FOUND, "NO_STATION_LOG",
+                            f"台站 {st} 的日志上传于计分版本 v{version_no} "
+                            f"冻结之后；该版本的反馈包只取冻结当时的日志")
                     raise ApiError(HTTPStatus.NOT_FOUND, "NO_STATION_LOG",
                                    f"台站 {st} 在本批次没有提交日志")
                 continue

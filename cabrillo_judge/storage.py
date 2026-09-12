@@ -222,11 +222,14 @@ class Storage:
                 "upload_ts": row["upload_ts"]}
 
     def get_submissions(self, batch_id: str) -> list[dict[str, Any]]:
+        # upload_ts 相同（同一秒上传）时按插入顺序（rowid）排列，
+        # 保证"最近上传"语义稳定
         rows = self.conn.execute(
             "SELECT * FROM logs WHERE batch_id = ? ORDER BY upload_ts, "
-            "filename", (batch_id,)).fetchall()
+            "rowid", (batch_id,)).fetchall()
         return [{"log_id": r["id"], "filename": r["filename"],
                  "station_call": r["station_call"],
+                 "upload_ts": r["upload_ts"],
                  "parsed": json.loads(r["parsed_json"])} for r in rows]
 
     # -- findings ---------------------------------------------------------

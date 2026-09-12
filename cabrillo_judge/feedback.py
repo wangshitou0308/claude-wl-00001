@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
+import re
 import time
 from typing import Any
 
@@ -31,7 +32,8 @@ from .parser import normalize_callsign
 
 REDACTION_NOTE = (
     "对外包：不含其他台站的原始行、邮件地址与完整交换内容；"
-    "仅保留解释本台得失所需的对方呼号与字段级差异项。")
+    "仅保留解释本台得失所需的对方呼号与字段级差异项。"
+    "自由文本（如裁决理由）中的邮件地址与他台 QSO 原文一律隐去。")
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +54,29 @@ def report_content_hash(report: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 版本-日志绑定：旧版本报告只取冻结当时的日志
+# ---------------------------------------------------------------------------
+
+def version_bound_logs(version: dict[str, Any],
+                       logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """返回冻结该计分版本时在场的日志（后续上传的绝不混入）。
+
+    快照含 ``logs`` 清单（log_id）时按清单过滤——这是冻结时的权威记录；
+    早期无清单的版本退化为按冻结时间 ``created_ts`` 截断。
+    """
+    snapshot = version.get("snapshot") or {}
+    manifest = snapshot.get("logs")
+    if isinstance(manifest, list):
+        ids = {m.get("log_id") for m in manifest if isinstance(m, dict)}
+        return [l for l in logs if l.get("log_id") in ids]
+    cutoff = version.get("created_ts")
+    if cutoff is None:
+        return list(logs)
+    return [l for l in logs
+            if int(l.get("upload_ts") or 0) <= int(cutoff)]
+
+
+# ---------------------------------------------------------------------------
 # 报告构建
 # ---------------------------------------------------------------------------
 
@@ -63,10 +88,13 @@ def _fmt_ts(ts: int | None) -> str:
 
 
 def _claimed_score(logs: list[dict[str, Any]]) -> int | None:
-    """取该台站最近一份日志中合法的 CLAIMED-SCORE（整数）。"""
+    """取该台站最近一份日志中合法的 CLAIMED-SCORE（整数）。
+
+    按上传时间稳定排序（Python sorted 稳定，输入顺序即插入顺序，
+    同一秒上传时后插入者视为最近）。
+    """
     claimed: int | None = None
-    for log in sorted(logs, key=lambda l: (l.get("upload_ts", 0),
-                                           l["filename"])):
+    for log in sorted(logs, key=lambda l: l.get("upload_ts") or 0):
         value = (log["parsed"].get("headers") or {}).get("CLAIMED-SCORE")
         if value is None:
             continue
@@ -116,6 +144,8 @@ def build_station_report(*, batch: dict[str, Any],
     *version* 为 ``storage.get_version`` 返回的行（含 snapshot）；
     *logs* 为该台站在本批次的全部提交（含 parsed）；
     *corrects* 为被替代旧包的存储行（生成更正包时传入）。
+    只取冻结该版本时在场的日志（版本-日志绑定，见
+    :func:`version_bound_logs`），冻结后上传的日志绝不混入。
     """
     snapshot = version["snapshot"]
     rules = snapshot.get("rules") or {}
@@ -123,6 +153,7 @@ def build_station_report(*, batch: dict[str, Any],
     results = snapshot.get("results") or {}
     now = int(now if now is not None else time.time())
 
+    logs = version_bound_logs(version, list(logs))
     log_ids = {l["log_id"] for l in logs}
 
     # 索引：本台 (log_id, 行号) -> [(finding, ref_index)]
@@ -141,8 +172,7 @@ def build_station_report(*, batch: dict[str, Any],
     entries: list[dict[str, Any]] = []
     used_findings: set[str] = set()
 
-    for log in sorted(logs, key=lambda l: (l.get("upload_ts", 0),
-                                           l["filename"])):
+    for log in sorted(logs, key=lambda l: l.get("upload_ts") or 0):
         parsed = log["parsed"]
         raw_by_line = {rl["line"]: rl["text"]
                        for rl in parsed.get("raw_lines", [])}
@@ -396,12 +426,43 @@ def _accumulate_new_multipliers(rules: dict[str, Any], station: str,
 # 对外脱敏包
 # ---------------------------------------------------------------------------
 
+# 自由文本（裁决理由等）中必须清掉的敏感内容：邮件地址、他台完整 QSO 行
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_QSO_LINE_RE = re.compile(
+    r"(?:X-QSO|QSO):\s*\d+\s+\S+\s+\d{4}-\d{2}-\d{2}\s+\d{3,4}\b[^\n]*")
+EMAIL_PLACEHOLDER = "〔已隐去邮件地址〕"
+QSO_PLACEHOLDER = "〔已隐去他台QSO原文〕"
+
+
+def _sanitize_text(text: str) -> str:
+    """清洗自由文本：邮件地址与他台完整 QSO 行一律替换为占位符。"""
+    text = _EMAIL_RE.sub(EMAIL_PLACEHOLDER, text)
+    text = _QSO_LINE_RE.sub(QSO_PLACEHOLDER, text)
+    return text
+
+
+def _sanitize_tree(obj: Any, skip_keys: frozenset = frozenset()) -> Any:
+    """递归清洗结构中的全部字符串；``skip_keys`` 列出的键原样保留。"""
+    if isinstance(obj, str):
+        return _sanitize_text(obj)
+    if isinstance(obj, list):
+        return [_sanitize_tree(x, skip_keys) for x in obj]
+    if isinstance(obj, dict):
+        return {k: (v if k in skip_keys else _sanitize_tree(v, skip_keys))
+                for k, v in obj.items()}
+    return obj
+
+
 def build_external_report(internal: dict[str, Any]) -> dict[str, Any]:
-    """由内部稿派生对外包：剔除其他台站原始行等敏感内容。"""
+    """由内部稿派生对外包：剔除其他台站原始行，并清洗自由文本中的
+    邮件地址与他台 QSO 原文。本台自己的原日志行（entries[].raw）保留。"""
     ext = json.loads(json.dumps(internal, ensure_ascii=False))
     ext["view"] = "external"
     for e in ext.get("entries", []):
         e.pop("refs", None)  # 其他台站的原始行不进入对外包
+    # 本台自己的原日志行是对外包的核心内容，不参与清洗；其余所有字符串
+    # （裁决理由、批次名、文件名、差异项取值等）一律过敏感词清洗
+    ext = _sanitize_tree(ext, skip_keys={"raw"})
     ext["redaction_note"] = REDACTION_NOTE
     return ext
 

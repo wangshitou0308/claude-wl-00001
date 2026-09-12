@@ -757,6 +757,122 @@ with tempfile.TemporaryDirectory() as d:
           and r["count"] == 1
           and r["reports"][0]["id"] == rid_a2, str(r)[:200])
 
+    # --- 缺陷回归 1：裁决理由中的邮件地址/他台完整 QSO 行必须在对外输出中清掉 ---
+    st_code, r = api2("GET",
+                      f"/api/batches/{fbid}/findings?status=TIME_DRIFT")
+    fid_td = r["findings"][0]["id"]
+    leaky_reason = ("已邮件联系 judge@example.org 确认；对方原行 "
+                    "QSO: 7023 CW 2026-09-10 0214 BG2BBB 599 005 "
+                    "BG1AAA 599 005 与台站自述一致")
+    st_code, r = api2("POST",
+                      f"/api/batches/{fbid}/findings/{fid_td}/decision",
+                      {"resolution": "CONFIRMED", "reason": leaky_reason,
+                       "judge": "测试员"})
+    check("反馈包：含敏感内容的裁决理由可登记", st_code == 200, str(r)[:200])
+    st_code, r = api2("POST", f"/api/batches/{fbid}/versions", {"note": "v3"})
+    check("反馈包：冻结计分版本 3", st_code == 201
+          and r["version_no"] == 3, str(r)[:200])
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback",
+                      {"version_no": 3, "station": "BG1AAA"})
+    rid_a3 = r["reports"][0]["report"]["id"]
+    check("反馈包：v3 自动生成更正包",
+          r["reports"][0]["report"]["kind"] == "correction")
+
+    st_code, r = api2("GET", f"/api/batches/{fbid}/feedback/{rid_a3}")
+    ent16 = next(e for e in r["content"]["entries"] if e["line"] == 16)
+    check("反馈包：内部稿保留裁决理由原文（供裁判核对）",
+          ent16["decision"]["reason"] == leaky_reason,
+          ent16["decision"]["reason"][:120])
+
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback/{rid_a3}/preview")
+    ext3 = r["external"]
+    ext3_text = json.dumps(ext3, ensure_ascii=False)
+    check("反馈包：对外稿清掉裁决理由中的邮件地址",
+          "judge@example.org" not in ext3_text
+          and "〔已隐去邮件地址〕" in ext3_text)
+    check("反馈包：对外稿清掉他台完整 QSO 行",
+          "QSO: 7023 CW 2026-09-10 0214" not in ext3_text
+          and "〔已隐去他台QSO原文〕" in ext3_text)
+    ent16x = next(e for e in ext3["entries"] if e["line"] == 16)
+    check("反馈包：对外稿裁决理由被占位符替换",
+          "judge@example.org" not in ent16x["decision"]["reason"]
+          and "〔已隐去邮件地址〕" in ent16x["decision"]["reason"]
+          and "〔已隐去他台QSO原文〕" in ent16x["decision"]["reason"],
+          ent16x["decision"]["reason"])
+    check("反馈包：对外稿仍保留本台原行与对方呼号",
+          ent16x["raw"].startswith("QSO:") and ent16x["partner"] == "BG2BBB")
+
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback/{rid_a3}/publish")
+    check("反馈包：脱敏后可发布", st_code == 200
+          and r["report"]["status"] == "published", str(r)[:200])
+    st_code, txt = api2("GET", f"/api/batches/{fbid}/feedback/{rid_a3}"
+                               f"/download?format=txt", raw=True)
+    check("反馈包：发布的纯文本不含敏感内容",
+          st_code == 200 and "judge@example.org" not in txt
+          and "QSO: 7023 CW 2026-09-10 0214" not in txt
+          and "〔已隐去邮件地址〕" in txt, txt[:160])
+    st_code, txt = api2("GET", f"/api/batches/{fbid}/feedback/{rid_a3}"
+                               f"/download?format=txt&view=internal",
+                        raw=True)
+    check("反馈包：内部稿纯文本仍可见原始理由",
+          st_code == 200 and "judge@example.org" in txt, txt[:160])
+
+    # --- 缺陷回归 2：版本-日志绑定，冻结后上传的日志不得混入旧版本报告 ---------
+    NEW_LOG_A = DEMO_LOG_A.replace("CLAIMED-SCORE: 7",
+                                   "CLAIMED-SCORE: 999").replace(
+        "END-OF-LOG:",
+        "QSO: 7023 CW 2026-09-10 0400 BG1AAA 599 008 BG9ZZZ 599 001\n"
+        "END-OF-LOG:")
+    st_code, r = api2("POST", f"/api/batches/{fbid}/logs",
+                      {"filename": "BG1AAA-v2.log", "content": NEW_LOG_A})
+    check("反馈包：冻结后可再上传该台站新日志", st_code == 201,
+          str(r)[:200])
+
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback",
+                      {"version_no": 3, "station": "BG1AAA"})
+    check("反馈包：新日志不混入 v3（内容不变，幂等返回）",
+          r["reports"][0].get("identical_to") == rid_a3,
+          json.dumps(r, ensure_ascii=False)[:300])
+    st_code, r = api2("GET", f"/api/batches/{fbid}/feedback/{rid_a3}")
+    rep3 = r["content"]
+    check("反馈包：v3 报告只含冻结时的日志",
+          [l["filename"] for l in rep3["logs"]] == ["BG1AAA.log"]
+          and rep3["summary"]["claimed_score"] == 7
+          and len(rep3["entries"]) == 7,
+          json.dumps(rep3["logs"], ensure_ascii=False))
+
+    NEW_LOG_Z = GOOD_LOG.replace("BG1AAA", "BG9ZZZ")
+    st_code, r = api2("POST", f"/api/batches/{fbid}/logs",
+                      {"filename": "BG9ZZZ.log", "content": NEW_LOG_Z})
+    check("反馈包：新台站日志上传", st_code == 201, str(r)[:200])
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback",
+                      {"version_no": 3, "station": "BG9ZZZ"})
+    check("反馈包：冻结后才有日志的台站不能生成旧版本报告",
+          st_code == 404 and r["error"] == "NO_STATION_LOG"
+          and "冻结之后" in r["message"], str(r)[:200])
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback",
+                      {"version_no": 3})
+    check("反馈包：整批生成也不含冻结后才有日志的台站",
+          "BG9ZZZ" not in {x["report"]["station"] for x in r["reports"]},
+          json.dumps(r, ensure_ascii=False)[:300])
+
+    st_code, r = api2("POST", f"/api/batches/{fbid}/versions", {"note": "v4"})
+    check("反馈包：冻结计分版本 4（含新日志）", st_code == 201
+          and r["version_no"] == 4, str(r)[:200])
+    st_code, r = api2("POST", f"/api/batches/{fbid}/feedback",
+                      {"version_no": 4, "station": "BG1AAA"})
+    rid_a4 = r["reports"][0]["report"]["id"]
+    st_code, r = api2("GET", f"/api/batches/{fbid}/feedback/{rid_a4}")
+    rep4 = r["content"]
+    check("反馈包：v4 绑定冻结时的全部日志（含新上传）",
+          sorted(l["filename"] for l in rep4["logs"])
+          == ["BG1AAA-v2.log", "BG1AAA.log"]
+          and rep4["summary"]["claimed_score"] == 999
+          and len(rep4["entries"]) == 15
+          and any(e["filename"] == "BG1AAA-v2.log"
+                  for e in rep4["entries"]),
+          json.dumps(rep4["logs"], ensure_ascii=False))
+
     server.shutdown()
     server.server_close()
 
@@ -797,6 +913,55 @@ check("纯文本渲染包含无法关联证据段",
 check("报告内容哈希稳定（幂等）",
       report_content_hash(rep_u) == report_content_hash(
           json.loads(json.dumps(rep_u))))
+
+# --- 反馈包：版本-日志绑定（单元级） ---------------------------------------------
+from cabrillo_judge.feedback import version_bound_logs, _sanitize_text
+
+logs_two = [
+    {"log_id": "L1", "filename": "a.log", "station_call": "BG1AAA",
+     "upload_ts": 1000, "parsed": pa},
+    {"log_id": "L2", "filename": "a2.log", "station_call": "BG1AAA",
+     "upload_ts": 2000, "parsed": pa},
+]
+ver_legacy = {"version_no": 1, "content_hash": "h", "created_ts": 1500,
+              "snapshot": {"rules": rules, "findings": [],
+                           "results": {"scorecards": []}}}
+rep_b = build_station_report(batch={"id": "B", "name": "t"},
+                             version=ver_legacy, station="BG1AAA",
+                             logs=logs_two)
+check("无清单的旧版快照按冻结时间绑定日志",
+      [l["filename"] for l in rep_b["logs"]] == ["a.log"],
+      json.dumps(rep_b["logs"], ensure_ascii=False))
+ver_manifest = {"version_no": 2, "content_hash": "h", "created_ts": 3000,
+                "snapshot": {"rules": rules, "findings": [],
+                             "results": {"scorecards": []},
+                             "logs": [{"log_id": "L2", "filename": "a2.log",
+                                       "station_call": "BG1AAA",
+                                       "upload_ts": 2000}]}}
+rep_m = build_station_report(batch={"id": "B", "name": "t"},
+                             version=ver_manifest, station="BG1AAA",
+                             logs=logs_two)
+check("含清单的快照按 log_id 绑定日志（不受上传时间影响）",
+      [l["filename"] for l in rep_m["logs"]] == ["a2.log"],
+      json.dumps(rep_m["logs"], ensure_ascii=False))
+check("version_bound_logs 不改动原列表",
+      len(logs_two) == 2)
+
+# --- 反馈包：自由文本脱敏（单元级） ----------------------------------------------
+s = _sanitize_text("联系 judge@example.org，见 "
+                   "QSO: 7023 CW 2026-09-10 0214 BG2BBB 599 005 "
+                   "BG1AAA 599 005 可证")
+check("自由文本隐去邮件地址与他台 QSO 原文",
+      "judge@example.org" not in s and "QSO:" not in s
+      and "〔已隐去邮件地址〕" in s and "〔已隐去他台QSO原文〕" in s, s)
+check("X-QSO 行同样被隐去",
+      "QSO:" not in _sanitize_text(
+          "X-QSO: 3523 CW 2026-09-10 0330 BG3CCC 579 002 BG9ZZZ 579 001"))
+check("普通中文理由不受影响",
+      _sanitize_text("双方记录一致，确认计分") == "双方记录一致，确认计分")
+check("呼号与行号文本不误伤",
+      _sanitize_text("BG1AAA 第 14 行抄收 559，对方实发 599")
+      == "BG1AAA 第 14 行抄收 559，对方实发 599")
 
 print()
 if failures:

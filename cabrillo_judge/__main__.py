@@ -224,7 +224,11 @@ def seed_feedback_demo(storage: Storage, bid: str) -> bool:
         "batch_id": bid, "version_no": 1, "content_hash": digest,
         "batch_name": batch["name"], "rules": batch["rules"],
         "decisions": decisions, "findings": annotated,
-        "results": results, "clock_scheme": None,
+        "results": results,
+        "logs": [{"log_id": s["log_id"], "filename": s["filename"],
+                  "station_call": s["station_call"],
+                  "upload_ts": s["upload_ts"]} for s in submissions],
+        "clock_scheme": None,
         "created_ts": int(time.time()),
     }
     storage.save_version(bid, 1, digest, "示例冻结版本（反馈包演示）", snapshot)
