@@ -21,6 +21,18 @@ from typing import Any
 from urllib.parse import urlparse, parse_qs
 
 from . import __version__
+from .appeals import (
+    CASE_STATUSES,
+    CONCLUSION_LABELS,
+    SUBJECT_LABELS,
+    apply_rulings,
+    case_content_hash,
+    outcome_scorecard_diff,
+    preview_digest,
+    snapshot_finding_index,
+    validate_claims,
+    validate_rulings,
+)
 from .clockskew import DEFAULT_MIN_SAMPLES, analyze_clock_skew
 from .engine import (
     PENDING_STATUSES,
@@ -29,6 +41,7 @@ from .engine import (
     apply_decisions,
     content_hash,
     score,
+    validate_judge_decision,
 )
 from .feedback import (
     build_external_report,
@@ -39,7 +52,7 @@ from .feedback import (
 )
 from .parser import normalize_callsign, parse_cabrillo
 from .rules import default_rules, validate_rules
-from .storage import Storage, new_id
+from .storage import AppealStale, Storage, new_id
 
 DOC_TITLE = "Cabrillo 离线日志裁决 API"
 
@@ -153,6 +166,34 @@ API_SPEC: dict[str, Any] = {
                  "view=internal|external（已发布默认 external）"},
         {"method": "GET", "path": "/api/batches/{id}/feedback/{rid}/lineage",
          "desc": "版本追踪：该包的更正链（被谁替代、替代谁）"},
+        {"method": "POST", "path": "/api/batches/{id}/appeals",
+         "desc": "创建赛后复议案件（须针对已发布反馈包）。JSON: "
+                 "{report_id, claims:[{subject（log_line|pairing_status|"
+                 "exchange_diff|penalty|summary_score）, summary, "
+                 "finding_id?, log_refs?[{filename,line}]?}], applicant?}。"
+                 "案件绑定反馈包、计分版本及内容哈希；引用不属本台、"
+                 "目标不在报告中或包已被更正时明确拒绝且不自动改绑"},
+        {"method": "GET", "path": "/api/batches/{id}/appeals",
+         "desc": "案件筛选。查询参数 status（submitted|in_review|"
+                 "withdrawn|closed）、station、report_id"},
+        {"method": "GET", "path": "/api/batches/{id}/appeals/{cid}",
+         "desc": "案件详情：争议项、逐项结论、状态轨迹、绑定快照与结果"},
+        {"method": "POST", "path": "/api/batches/{id}/appeals/{cid}/accept",
+         "desc": "裁判受理案件（submitted → in_review）。JSON: {judge?}"},
+        {"method": "POST", "path": "/api/batches/{id}/appeals/{cid}/withdraw",
+         "desc": "申请方撤回未受理案件（submitted → withdrawn）。JSON: {reason?}"},
+        {"method": "POST", "path": "/api/batches/{id}/appeals/{cid}/preview",
+         "desc": "处理预览：逐项给出 upheld|revised|insufficient 结论"
+                 "（revised 须带 resolution/reason，可带 fault_station/"
+                 "penalty_code/judge）；返回裁决变更与计分预览，不写入"},
+        {"method": "POST", "path": "/api/batches/{id}/appeals/{cid}/confirm",
+         "desc": "确认处理：再次核对全部引用与绑定哈希，任一项失效整案不"
+                 "写入；通过后一次性写入改判、冻结新计分版本，得分变化时"
+                 "生成沿用既有替代关系的更正包并结案。JSON 与预览一致，"
+                 "另可带 digest（预览返回值）、note、judge"},
+        {"method": "GET", "path": "/api/batches/{id}/appeals/{cid}/download",
+         "desc": "下载案件 JSON（含绑定快照、争议项、结论、轨迹、"
+                 "裁决变更、计分预览/结果、更正包信息）"},
         {"method": "GET", "path": "/api/docs",
          "desc": "机器可读 API 说明（本对象）"},
     ],
@@ -215,6 +256,32 @@ API_SPEC: dict[str, Any] = {
                      "或完整交换内容，只保留解释本台得失所需的对方呼号与"
                      "差异项；裁决理由等自由文本中的邮件地址与他台 QSO "
                      "原文一律隐去（本台自己的原日志行保留）",
+    },
+    "appeals": {
+        "summary": "赛后复议案件：台站对已发布反馈包提出异议；"
+                   "状态 submitted→in_review→closed，未受理可 withdrawn；"
+                   "sqlite3 记录案件、争议项、处理意见与状态轨迹",
+        "claims": "争议项对象 subject 为 log_line/pairing_status/"
+                  "exchange_diff/penalty/summary_score，可引用 finding_id "
+                  "与本台日志行 log_refs（文件名+行号）",
+        "binding": "创建即绑定反馈包 ID 与内容哈希、计分版本号与内容哈希，"
+                   "并计算案件绑定哈希；引用不属于该台站、目标未出现在报告、"
+                   "或反馈包已有后续更正时明确拒绝且不自动改绑",
+        "workflow": [
+            "POST .../appeals {report_id, claims:[...]} 创建案件（submitted）",
+            "POST .../appeals/{cid}/accept 裁判受理（in_review）",
+            "POST .../appeals/{cid}/preview 逐项 upheld/revised/"
+            "insufficient，预览裁决变更与计分（不写入）",
+            "POST .../appeals/{cid}/confirm 复核全部绑定后一次性写入，"
+            "冻结新计分版本；得分变化时生成沿用替代关系的更正包并结案",
+            "未受理案件可由申请方 POST .../appeals/{cid}/withdraw 撤回",
+        ],
+        "atomicity": "确认时再次核对反馈包/版本内容哈希、报告未被替代、"
+                     "配对证据集与现行裁决未漂移、逐项引用仍有效；"
+                     "任一项失效返回 409 APPEAL_STALE 且整案不写入",
+        "immutability": "原反馈包内容永不改写；得分变化时新建 kind=correction "
+                        "的已发布更正包，旧包只写 superseded_by 指针，"
+                        "沿用反馈包既有的线性替代关系",
     },
 }
 
@@ -503,6 +570,37 @@ class JudgeHandler(BaseHTTPRequestHandler):
             m = re.fullmatch(r"/api/batches/([^/]+)/feedback/([^/]+)", path)
             if m and method == "GET":
                 return self._get_feedback(m.group(1), m.group(2))
+            # 赛后复议案件：字面量后缀路由先于 {cid} 通配
+            m = re.fullmatch(r"/api/batches/([^/]+)/appeals", path)
+            if m:
+                bid = m.group(1)
+                if method == "GET":
+                    return self._list_appeals(bid)
+                if method == "POST":
+                    return self._create_appeal(bid)
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/appeals/([^/]+)/accept", path)
+            if m and method == "POST":
+                return self._accept_appeal(m.group(1), m.group(2))
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/appeals/([^/]+)/withdraw", path)
+            if m and method == "POST":
+                return self._withdraw_appeal(m.group(1), m.group(2))
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/appeals/([^/]+)/preview", path)
+            if m and method == "POST":
+                return self._preview_appeal(m.group(1), m.group(2))
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/appeals/([^/]+)/confirm", path)
+            if m and method == "POST":
+                return self._confirm_appeal(m.group(1), m.group(2))
+            m = re.fullmatch(
+                r"/api/batches/([^/]+)/appeals/([^/]+)/download", path)
+            if m and method == "GET":
+                return self._download_appeal(m.group(1), m.group(2))
+            m = re.fullmatch(r"/api/batches/([^/]+)/appeals/([^/]+)", path)
+            if m and method == "GET":
+                return self._get_appeal(m.group(1), m.group(2))
             m = re.fullmatch(r"/api/batches/([^/]+)/download", path)
             if m and method == "GET":
                 return self._download(m.group(1))
@@ -515,6 +613,12 @@ class JudgeHandler(BaseHTTPRequestHandler):
         except PermissionError as exc:
             self._send_json({"error": "BATCH_LOCKED",
                              "message": str(exc)}, HTTPStatus.CONFLICT)
+        except AppealStale as exc:
+            self._send_json({"error": "APPEAL_STALE",
+                             "message": "案件绑定依据已失效，整案不写入；"
+                                        "请核对后重新预览/确认，或针对最新"
+                                        "反馈包重新提案",
+                             "details": exc.problems}, HTTPStatus.CONFLICT)
         except KeyError as exc:
             self._send_json({"error": "NOT_FOUND",
                              "message": str(exc).strip("'")},
@@ -1125,34 +1229,29 @@ class JudgeHandler(BaseHTTPRequestHandler):
         fault = body.get("fault_station")
         if fault is not None:
             fault = str(fault).upper()
-            if fault not in finding.get("stations", []) and not (
-                    finding["refs"] and
-                    finding["refs"][0].get("station") == fault):
-                raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_FAULT_STATION",
-                               f"fault_station 必须是相关台站之一: "
-                               f"{finding.get('stations')}")
         penalty = body.get("penalty_code")
         if penalty is not None:
             penalty = str(penalty)
-            if penalty not in batch["rules"].get("penalties", {}):
+        problems = validate_judge_decision(
+            batch["rules"], finding, resolution=resolution,
+            reason=reason, fault_station=fault, penalty_code=penalty)
+        # 保持既有错误码粒度：逐类返回与旧接口一致的 400
+        if problems:
+            if resolution not in RESOLUTIONS:
                 raise ApiError(
-                    HTTPStatus.BAD_REQUEST, "BAD_PENALTY_CODE",
-                    f"penalty_code 必须在规则罚分目录中: "
-                    f"{sorted(batch['rules']['penalties'])}")
-        # Resolution/status sanity.
-        st = finding["status"]
-        allowed = {
-            "EXCHANGE_DIFF": {"CONFIRMED", "REMOVED"},
-            "TIME_DRIFT": {"CONFIRMED", "REMOVED"},
-            "SUSPECT_CALL": {"CONFIRMED", "REMOVED"},
-            "NO_PARTNER_LOG": {"GRANTED", "WAIVED", "REMOVED"},
-            "UNIQUE": {"WAIVED", "REMOVED", "GRANTED"},
-            "DUP": {"WAIVED", "REMOVED"},
-            "MATCH": {"REMOVED"},
-        }[st]
-        if resolution not in allowed:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_RESOLUTION_FOR_STATUS",
-                           f"{st} 状态只接受 {sorted(allowed)}")
+                    HTTPStatus.BAD_REQUEST, "BAD_RESOLUTION", problems[0])
+            if not reason.strip():
+                raise ApiError(HTTPStatus.BAD_REQUEST, "REASON_REQUIRED",
+                               problems[0])
+            p = next((x for x in problems if "fault_station" in x), None)
+            if p:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_FAULT_STATION", p)
+            p = next((x for x in problems if "penalty_code" in x), None)
+            if p:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PENALTY_CODE", p)
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST, "BAD_RESOLUTION_FOR_STATUS",
+                problems[0])
         judge = str(body.get("judge") or "").strip() or None
         dec = self.storage.upsert_decision(
             bid, fid, resolution, reason, fault, penalty, judge)
@@ -1327,6 +1426,11 @@ class JudgeHandler(BaseHTTPRequestHandler):
             "active_clock_scheme": (_public_scheme(scheme)
                                     if scheme else None),
             "archived_decisions": self.storage.list_archived_decisions(bid),
+            "feedback_reports": [
+                _slim_feedback(self.storage.get_feedback_report(r["id"]))
+                for r in self.storage.list_feedback_reports(bid)],
+            "appeals": [self._appeal_payload(c)
+                        for c in self.storage.list_appeal_cases(bid)],
             "content_hash": digest,
         }
         self._send_json(payload,
@@ -1581,6 +1685,395 @@ class JudgeHandler(BaseHTTPRequestHandler):
         self._send_json({"report_id": rid, "chain": chain,
                          "length": len(chain)})
 
+    # -- 赛后复议案件 --------------------------------------------------------
+    def _get_appeal_or_404(self, bid: str, cid: str) -> dict[str, Any]:
+        case = self.storage.get_appeal_case(cid)
+        if not case or case["batch_id"] != bid:
+            raise ApiError(HTTPStatus.NOT_FOUND, "APPEAL_NOT_FOUND",
+                           f"复议案件 {cid} 不存在")
+        return case
+
+    def _bound_version(self, case: dict[str, Any]) -> dict[str, Any]:
+        ver = self.storage.get_version(case["batch_id"], case["version_no"])
+        if not ver:
+            raise ApiError(HTTPStatus.NOT_FOUND, "VERSION_NOT_FOUND",
+                           f"案件绑定的计分版本 v{case['version_no']} 不存在")
+        return ver
+
+    def _normalize_claims(self, raw: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw, list) or not raw:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "CLAIMS_REQUIRED",
+                           "claims 必须是非空数组（每项一条异议主张）")
+        out: list[dict[str, Any]] = []
+        for n, c in enumerate(raw, start=1):
+            if not isinstance(c, dict):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_CLAIM",
+                               f"第 {n} 项争议必须是对象")
+            refs_in = c.get("log_refs") or []
+            refs: list[dict[str, Any]] = []
+            if refs_in:
+                if not isinstance(refs_in, list):
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_LOG_REFS",
+                                   f"第 {n} 项 log_refs 必须是数组")
+                for ref in refs_in:
+                    if not isinstance(ref, dict) or "filename" not in ref \
+                            or "line" not in ref:
+                        raise ApiError(
+                            HTTPStatus.BAD_REQUEST, "BAD_LOG_REF",
+                            f"第 {n} 项日志引用须为 {{filename, line}}")
+                    line = ref["line"]
+                    if isinstance(line, bool) or not isinstance(line, int):
+                        raise ApiError(
+                            HTTPStatus.BAD_REQUEST, "BAD_LOG_REF",
+                            f"第 {n} 项日志引用行号必须是整数：{line!r}")
+                    refs.append({"filename": str(ref["filename"]),
+                                 "line": line})
+            fid = c.get("finding_id")
+            out.append({
+                "id": new_id("CL"),
+                "subject": str(c.get("subject") or ""),
+                "summary": str(c.get("summary") or ""),
+                "finding_id": str(fid) if fid else None,
+                "log_refs": refs,
+            })
+        return out
+
+    def _create_appeal(self, bid: str) -> None:
+        batch = self._get_batch_or_404(bid)
+        body = self._json_body()
+        rid = body.get("report_id")
+        if not rid:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "MISSING_PARAM",
+                           "需要 report_id（被异议的已发布反馈包 ID）")
+        rep = self.storage.get_feedback_report(str(rid))
+        if not rep or rep["batch_id"] != bid:
+            raise ApiError(HTTPStatus.NOT_FOUND, "FEEDBACK_NOT_FOUND",
+                           f"反馈包 {rid} 不存在")
+        if rep["status"] != "published":
+            raise ApiError(
+                HTTPStatus.CONFLICT, "FEEDBACK_NOT_PUBLISHED",
+                f"反馈包 {rid} 尚未发布；复议只受理针对已发布反馈包的异议，"
+                f"草稿问题请直接在裁判流程中处理")
+        # 反馈包已有后续更正：明确提示，不自动改绑到更正包
+        if rep.get("superseded_by"):
+            newer = self.storage.get_feedback_report(rep["superseded_by"])
+            hint = (f"（最新包 {newer['id']}，基于计分版本 "
+                    f"v{newer['version_no']}）") if newer else ""
+            raise ApiError(
+                HTTPStatus.CONFLICT, "REPORT_SUPERSEDED",
+                f"反馈包 {rid} 已有后续更正包 {rep['superseded_by']}{hint}，"
+                f"原包不再受理复议；请针对最新发布的反馈包重新提案"
+                f"（系统不会自动改绑）")
+        ver = self.storage.get_version(bid, rep["version_no"])
+        if not ver:
+            raise ApiError(HTTPStatus.NOT_FOUND, "VERSION_NOT_FOUND",
+                           f"反馈包绑定的计分版本 v{rep['version_no']} 不存在")
+        # 存储的包哈希与重算值必须一致（不可变完整性自检）
+        if rep["content_hash"] != report_content_hash(rep["report"]):
+            raise ApiError(
+                HTTPStatus.CONFLICT, "REPORT_HASH_MISMATCH",
+                f"反馈包 {rid} 的内容哈希与现存正文不一致，无法建立绑定")
+        prior = self.storage.list_appeal_cases(
+            bid, station=rep["station"], report_id=rep["id"])
+        open_case = next((c for c in prior
+                          if c["status"] in ("submitted", "in_review")), None)
+        if open_case:
+            raise ApiError(
+                HTTPStatus.CONFLICT, "APPEAL_ALREADY_EXISTS",
+                f"反馈包 {rid} 已有 {open_case['status']} 状态的案件 "
+                f"{open_case['id']}；已撤回或已结案后可重新提案")
+
+        claims = self._normalize_claims(body.get("claims"))
+        problems = validate_claims(
+            claims, station=rep["station"], report=rep["report"],
+            version_snapshot=ver["snapshot"])
+        if any(problems):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST, "INVALID_CLAIMS",
+                "争议项引用校验未通过；系统只提示问题，不自动改绑，请修正后"
+                "重新提交",
+                [{"seq": i + 1, "problems": p}
+                 for i, p in enumerate(problems) if p])
+
+        applicant = body.get("applicant")
+        applicant = str(applicant).strip() if applicant else None
+        binding_hash = case_content_hash(
+            report_id=rep["id"], station=rep["station"],
+            version_no=rep["version_no"],
+            version_content_hash=ver["content_hash"],
+            report_content_hash=rep["content_hash"], claims=claims)
+        cid = new_id("CASE")
+        case = self.storage.create_appeal_case(
+            cid, bid, rep["station"], rep["id"], rep["version_no"],
+            ver["content_hash"], rep["content_hash"], binding_hash,
+            claims, applicant)
+
+        warnings: list[str] = []
+        latest_ver = self.storage.list_versions(bid)[-1]["version_no"] \
+            if self.storage.list_versions(bid) else rep["version_no"]
+        if latest_ver > rep["version_no"]:
+            warnings.append(
+                f"批次已冻结至计分版本 v{latest_ver}（本包基于 "
+                f"v{rep['version_no']}）；该反馈包尚无后续更正包，"
+                f"案件仍按 v{rep['version_no']} 绑定快照受理")
+        self._send_json(
+            {"case": _slim_appeal(case),
+             "binding": {"report_id": rep["id"],
+                         "report_content_hash": rep["content_hash"],
+                         "version_no": rep["version_no"],
+                         "version_content_hash": ver["content_hash"],
+                         "binding_content_hash": binding_hash},
+             "claims": self.storage.list_appeal_claims(cid),
+             "warnings": warnings}, HTTPStatus.CREATED)
+
+    def _list_appeals(self, bid: str) -> None:
+        self._get_batch_or_404(bid)
+        q = self._query()
+        status = q.get("status")
+        if status and status not in CASE_STATUSES:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_STATUS",
+                           f"status 必须是 {list(CASE_STATUSES)} 之一")
+        station = q.get("station")
+        if station:
+            station = normalize_callsign(station) or station.upper()
+        cases = self.storage.list_appeal_cases(
+            bid, status=status, station=station, report_id=q.get("report_id"))
+        out = []
+        for c in cases:
+            item = _slim_appeal(c)
+            claims = self.storage.list_appeal_claims(c["id"])
+            item["claim_count"] = len(claims)
+            item["subjects"] = sorted({cl["subject"] for cl in claims})
+            out.append(item)
+        self._send_json({"cases": out, "count": len(out)})
+
+    def _appeal_payload(self, case: dict[str, Any]) -> dict[str, Any]:
+        rep = self.storage.get_feedback_report(case["report_id"])
+        ver = self.storage.get_version(case["batch_id"], case["version_no"])
+        claims = []
+        for cl in self.storage.list_appeal_claims(case["id"]):
+            claims.append({**cl, "subject_label":
+                           SUBJECT_LABELS.get(cl["subject"]),
+                           "conclusion_label":
+                           CONCLUSION_LABELS.get(cl["conclusion"] or "")})
+        outcome = None
+        if case["status"] == "closed":
+            correction = None
+            if case.get("correction_report_id"):
+                corr = self.storage.get_feedback_report(
+                    case["correction_report_id"])
+                correction = _slim_feedback(corr) if corr else None
+            outcome = {
+                "resolved_version_no": case["resolved_version_no"],
+                "correction_report": correction,
+                "score_before": case["score_before"],
+                "score_after": case["score_after"],
+                "score_delta": ((case["score_after"] or 0)
+                                - (case["score_before"] or 0)),
+                "revised": [{"seq": cl["seq"], "finding_id": cl["finding_id"],
+                             "resolution": cl["resolution"],
+                             "rationale": cl["rationale"]}
+                            for cl in claims if cl["conclusion"] == "revised"]}
+        return {
+            "case": _slim_appeal(case),
+            "claims": claims,
+            "events": self.storage.list_appeal_events(case["id"]),
+            "binding": {
+                "report": _slim_feedback(rep) if rep else None,
+                "version": ({"version_no": ver["version_no"],
+                             "content_hash": ver["content_hash"],
+                             "note": ver["note"],
+                             "created_ts": ver["created_ts"]}
+                            if ver else None),
+                "binding_content_hash": case["binding_content_hash"]},
+            "outcome": outcome}
+
+    def _get_appeal(self, bid: str, cid: str) -> None:
+        self._get_batch_or_404(bid)
+        case = self._get_appeal_or_404(bid, cid)
+        self._send_json(self._appeal_payload(case))
+
+    def _accept_appeal(self, bid: str, cid: str) -> None:
+        self._get_batch_or_404(bid)
+        case = self._get_appeal_or_404(bid, cid)
+        if case["status"] != "submitted":
+            raise ApiError(
+                HTTPStatus.CONFLICT, "APPEAL_NOT_SUBMITTED",
+                f"案件当前为 {case['status']}，仅 submitted 可受理")
+        body = self._json_body() if self.headers.get("Content-Length") else {}
+        judge = str(body.get("judge") or "").strip() or None
+        self.storage.set_appeal_status(
+            cid, "in_review", judge=judge, actor=judge,
+            detail={"note": str(body.get("note") or "").strip() or None})
+        self._send_json({"case": _slim_appeal(
+            self.storage.get_appeal_case(cid)), "accepted": True})
+
+    def _withdraw_appeal(self, bid: str, cid: str) -> None:
+        self._get_batch_or_404(bid)
+        case = self._get_appeal_or_404(bid, cid)
+        if case["status"] != "submitted":
+            raise ApiError(
+                HTTPStatus.CONFLICT, "APPEAL_NOT_WITHDRAWABLE",
+                f"案件当前为 {case['status']}；仅未受理（submitted）案件"
+                f"可由申请方撤回，受理后须由裁判结案")
+        body = self._json_body() if self.headers.get("Content-Length") else {}
+        reason = str(body.get("reason") or "").strip() or None
+        actor = str(body.get("applicant") or case.get("applicant") or ""
+                    ).strip() or None
+        self.storage.set_appeal_status(
+            cid, "withdrawn", actor=actor, detail={"reason": reason})
+        self._send_json({"case": _slim_appeal(
+            self.storage.get_appeal_case(cid)), "withdrawn": True})
+
+    def _load_rulings(self, case: dict[str, Any], ver: dict[str, Any]
+                      ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """读取并形式校验 rulings；返回 (rulings, outcome)，不合法抛 400。"""
+        body = self._json_body()
+        rulings = body.get("rulings")
+        if not isinstance(rulings, list) or not rulings:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "RULINGS_REQUIRED",
+                           "rulings 必须是非空数组（逐项结论）")
+        for r in rulings:
+            if not isinstance(r, dict) or not r.get("claim_id"):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_RULING",
+                               "每条结论须含 claim_id")
+        if len({r["claim_id"] for r in rulings}) != len(rulings):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_RULING",
+                           "同一争议项不得给出多条结论")
+        claims = self.storage.list_appeal_claims(case["id"])
+        problems = validate_rulings(
+            claims, rulings, rules=ver["snapshot"]["rules"],
+            findings_index=snapshot_finding_index(ver["snapshot"]))
+        problems = {k: v for k, v in problems.items() if v}
+        if problems:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST, "INVALID_RULINGS",
+                "逐项结论校验未通过", sorted(
+                    ({"claim_id": k, "problems": v}
+                     for k, v in problems.items()),
+                    key=lambda x: x["claim_id"]))
+        return rulings, body
+
+    def _scheme_slim(self, ver: dict[str, Any]) -> dict[str, Any] | None:
+        scheme = (ver["snapshot"] or {}).get("clock_scheme")
+        if not scheme:
+            return None
+        return {"reference_log_id": scheme.get("reference_log_id"),
+                "max_window_seconds": scheme.get("max_window_seconds"),
+                "offsets": scheme.get("offsets")}
+
+    def _preview_appeal(self, bid: str, cid: str) -> None:
+        self._get_batch_or_404(bid)
+        case = self._get_appeal_or_404(bid, cid)
+        if case["status"] != "in_review":
+            raise ApiError(
+                HTTPStatus.CONFLICT, "APPEAL_NOT_IN_REVIEW",
+                f"案件当前为 {case['status']}；先 POST .../accept 受理后才能"
+                f"作出逐项处理")
+        ver = self._bound_version(case)
+        rulings, body = self._load_rulings(case, ver)
+        snapshot = ver["snapshot"]
+        outcome = apply_rulings(
+            rules=snapshot["rules"], station=case["station"],
+            claims=self.storage.list_appeal_claims(case["id"]),
+            rulings=rulings, snapshot=snapshot)
+        digest = preview_digest(rulings)
+        prospective_hash = content_hash(
+            snapshot["rules"], outcome["annotated_findings"],
+            outcome["decisions"], outcome["results_after"],
+            clock_scheme=self._scheme_slim(ver))
+        self._send_json({
+            "case_id": cid, "digest": digest,
+            "judge": body.get("judge"),
+            "items": outcome["items"],
+            "changed_decisions": outcome["changed_decisions"],
+            "revision_count": outcome["revision_count"],
+            "station_score": outcome["station_score"],
+            "scorecard_diff": outcome_scorecard_diff(outcome),
+            "prospective_version_no": self.storage.next_version_no(bid),
+            "prospective_content_hash": prospective_hash,
+            "correction_required": outcome["score_changed"],
+            "note": "预览不写入任何数据；确认（POST .../confirm）时将再次核对"
+                    "全部引用与绑定哈希，任一项失效则整案不写入"})
+
+    def _confirm_appeal(self, bid: str, cid: str) -> None:
+        batch = self._get_batch_or_404(bid)
+        case = self._get_appeal_or_404(bid, cid)
+        if case["status"] != "in_review":
+            raise ApiError(
+                HTTPStatus.CONFLICT, "APPEAL_NOT_IN_REVIEW",
+                f"案件当前为 {case['status']}；仅 in_review 案件可确认处理")
+        ver = self._bound_version(case)
+        rulings, body = self._load_rulings(case, ver)
+        digest = body.get("digest")
+        if not digest:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST, "PREVIEW_REQUIRED",
+                "确认前须先 POST .../preview 取得处理预览，并在确认时回传 "
+                "digest，防止凭陈旧处理意见写入")
+        if digest != preview_digest(rulings):
+            raise ApiError(
+                HTTPStatus.CONFLICT, "PREVIEW_DIGEST_MISMATCH",
+                "确认内容与最近一次预览不一致；请重新生成预览并核对后再确认")
+        snapshot = ver["snapshot"]
+        outcome = apply_rulings(
+            rules=snapshot["rules"], station=case["station"],
+            claims=self.storage.list_appeal_claims(case["id"]),
+            rulings=rulings, snapshot=snapshot)
+        judge = str(body.get("judge") or case.get("judge") or ""
+                    ).strip() or None
+        note = str(body.get("note") or "").strip() or (
+            f"赛后复议案件 {cid} 改判冻结")
+        old_rep = self.storage.get_feedback_report(case["report_id"])
+        submissions = self.storage.get_submissions(bid)
+        station = case["station"]
+
+        def build_correction(new_version: dict[str, Any],
+                             _new_snapshot: dict[str, Any]
+                             ) -> dict[str, Any] | None:
+            if not outcome["score_changed"]:
+                return None
+            bound_logs = version_bound_logs(new_version, submissions)
+            station_logs = [s for s in bound_logs
+                            if s["station_call"] == station]
+            if not station_logs:
+                return None  # 极端情况：新版本清单内无该台日志
+            return build_station_report(
+                batch=batch, version=new_version, station=station,
+                logs=station_logs, kind="correction", corrects=old_rep)
+
+        result = self.storage.commit_appeal_rulings(
+            cid, rulings=rulings,
+            annotated_findings=outcome["annotated_findings"],
+            results=outcome["results_after"], rules=snapshot["rules"],
+            version_digest=None, clock_scheme_slim=self._scheme_slim(ver),
+            score_before=outcome["station_score"]["before"],
+            score_after=outcome["station_score"]["after"],
+            judge=judge, note=note, build_correction=build_correction)
+        payload = self._appeal_payload(self.storage.get_appeal_case(cid))
+        payload["confirmed"] = True
+        payload["frozen"] = result["frozen"]
+        payload["frozen_version"] = (
+            {"version_no": result["version_no"],
+             "content_hash": result["content_hash"]}
+            if result["frozen"] else None)
+        payload["correction_published"] = result["correction_report_id"]
+        self._send_json(payload)
+
+    def _download_appeal(self, bid: str, cid: str) -> None:
+        self._get_batch_or_404(bid)
+        case = self._get_appeal_or_404(bid, cid)
+        payload = self._appeal_payload(case)
+        envelope = {
+            "export": "cabrillo-judge-appeal",
+            "schema_version": 1,
+            "exported_ts": int(time.time()),
+            "batch_id": bid,
+            **payload,
+        }
+        self._send_json(envelope,
+                        download_name=f"{cid}-appeal.json")
+
 
 # ---------------------------------------------------------------------------
 # Serialisation helpers
@@ -1611,6 +2104,25 @@ def _slim_feedback(rep: dict[str, Any]) -> dict[str, Any]:
             "previewed_ts": rep["previewed_ts"],
             "published_ts": rep["published_ts"],
             "created_ts": rep["created_ts"]}
+
+
+def _slim_appeal(c: dict[str, Any]) -> dict[str, Any]:
+    """复议案件元数据。"""
+    return {"id": c["id"], "batch_id": c["batch_id"],
+            "station": c["station"], "report_id": c["report_id"],
+            "version_no": c["version_no"], "status": c["status"],
+            "applicant": c["applicant"], "judge": c["judge"],
+            "version_content_hash": c["version_content_hash"],
+            "report_content_hash": c["report_content_hash"],
+            "binding_content_hash": c["binding_content_hash"],
+            "resolved_version_no": c["resolved_version_no"],
+            "correction_report_id": c["correction_report_id"],
+            "score_before": c["score_before"],
+            "score_after": c["score_after"],
+            "received_ts": c["received_ts"],
+            "accepted_ts": c["accepted_ts"],
+            "withdrawn_ts": c["withdrawn_ts"],
+            "closed_ts": c["closed_ts"]}
 
 
 def _refs_key(finding: dict[str, Any]) -> tuple:
@@ -1725,6 +2237,25 @@ th{{background:#f7f7f7}}</style></head><body>
 <code>GET …/feedback/{{rid}}/lineage</code> 查看更正链</li>
 <li><code>GET …/feedback/{{rid}}/download?format=txt</code> 下载纯文本
 （<code>format=json</code> 下载 JSON）</li>
+</ol>
+<h2>赛后复议案件</h2>
+<ol>
+<li><code>POST /api/batches/{{id}}/appeals</code> 对<strong>已发布</strong>反馈包提案，
+绑定反馈包/计分版本与内容哈希；可对原日志行、配对状态、交换差异、罚分、
+汇总分提出多项主张并引用 finding 与本台日志行。引用不属于该台站、目标不在
+报告中、或包已有后续更正时<strong>明确拒绝且不自动改绑</strong></li>
+<li><code>POST …/appeals/{{cid}}/withdraw</code> 未受理（submitted）可由申请方撤回</li>
+<li><code>POST …/appeals/{{cid}}/accept</code> 裁判受理（in_review）</li>
+<li><code>POST …/appeals/{{cid}}/preview</code> 逐项给出
+<code>upheld</code>（维持）/<code>revised</code>（改判）/
+<code>insufficient</code>（证据不足），先看裁决变更与计分预览（不写入）</li>
+<li><code>POST …/appeals/{{cid}}/confirm</code> 回传预览 <code>digest</code> 确认；
+系统再次核对全部引用与绑定快照，<strong>任一项失效则整案不写入</strong>，
+通过后一次性写入改判、冻结新计分版本；得分变化时生成沿用既有替代关系的
+已发布更正包并结案。原反馈包永不改写</li>
+<li><code>GET …/appeals?status=&amp;station=&amp;report_id=</code> 筛选；
+<code>GET …/appeals/{{cid}}</code> 详情（争议项/意见/状态轨迹）；
+<code>GET …/appeals/{{cid}}/download</code> 下载案件 JSON</li>
 </ol>
 <h2>典型流程</h2>
 <ol>

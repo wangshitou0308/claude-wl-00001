@@ -13,6 +13,10 @@ import time
 import uuid
 from typing import Any
 
+from . import appeals as _appeals
+from . import feedback as _feedback
+from .engine import content_hash
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS batches (
     id          TEXT PRIMARY KEY,
@@ -108,6 +112,62 @@ CREATE TABLE IF NOT EXISTS feedback_reports (
 CREATE TABLE IF NOT EXISTS api_keys (
     -- placeholder table for future offline tokens; unused today
     key TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS appeal_cases (
+    -- 赛后复议案件：对已发布反馈包的异议；绑定反馈包/计分版本与内容哈希
+    id                       TEXT PRIMARY KEY,
+    batch_id                 TEXT NOT NULL REFERENCES batches(id)
+                             ON DELETE CASCADE,
+    station_call             TEXT NOT NULL,
+    report_id                TEXT NOT NULL,
+    version_no               INTEGER NOT NULL,
+    status                   TEXT NOT NULL DEFAULT 'submitted',
+    applicant                TEXT,
+    judge                    TEXT,
+    version_content_hash     TEXT NOT NULL,
+    report_content_hash      TEXT NOT NULL,
+    binding_content_hash     TEXT NOT NULL,
+    -- 确认改判后一次性冻结的新版本（无改判/无分差时为 NULL）
+    resolved_version_no      INTEGER,
+    correction_report_id     TEXT,
+    score_before             INTEGER,
+    score_after              INTEGER,
+    received_ts              INTEGER NOT NULL,
+    accepted_ts              INTEGER,
+    withdrawn_ts             INTEGER,
+    closed_ts                INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS appeal_claims (
+    id             TEXT PRIMARY KEY,
+    case_id        TEXT NOT NULL REFERENCES appeal_cases(id)
+                   ON DELETE CASCADE,
+    seq            INTEGER NOT NULL,
+    subject        TEXT NOT NULL,
+    summary        TEXT NOT NULL,
+    finding_id     TEXT,
+    log_refs_json  TEXT NOT NULL DEFAULT '[]',
+    -- 受理后逐项填写的结论
+    conclusion     TEXT,
+    resolution     TEXT,
+    fault_station  TEXT,
+    penalty_code   TEXT,
+    rationale      TEXT,
+    judge          TEXT,
+    UNIQUE(case_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS appeal_events (
+    id          TEXT PRIMARY KEY,
+    case_id     TEXT NOT NULL REFERENCES appeal_cases(id)
+                ON DELETE CASCADE,
+    seq         INTEGER NOT NULL,
+    event_type  TEXT NOT NULL,
+    actor       TEXT,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_ts  INTEGER NOT NULL,
+    UNIQUE(case_id, seq)
 );
 """
 
@@ -610,3 +670,487 @@ class Storage:
                 "UPDATE feedback_reports SET superseded_by = ? WHERE id = ?",
                 (new_id_, old_id))
             self.conn.commit()
+
+    # -- 赛后复议案件 --------------------------------------------------------
+    def create_appeal_case(self, case_id: str, batch_id: str, station: str,
+                           report_id: str, version_no: int,
+                           version_content_hash: str,
+                           report_content_hash: str,
+                           binding_hash: str,
+                           claims: list[dict[str, Any]],
+                           applicant: str | None) -> dict[str, Any]:
+        ts = _now()
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT INTO appeal_cases (id, batch_id, station_call, "
+                    "report_id, version_no, status, applicant, "
+                    "version_content_hash, report_content_hash, "
+                    "binding_content_hash, received_ts) "
+                    "VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?)",
+                    (case_id, batch_id, station, report_id, int(version_no),
+                     applicant, version_content_hash, report_content_hash,
+                     binding_hash, ts))
+                for i, c in enumerate(claims, start=1):
+                    self.conn.execute(
+                        "INSERT INTO appeal_claims (id, case_id, seq, subject, "
+                        "summary, finding_id, log_refs_json) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (c["id"], case_id, i, c["subject"],
+                         c["summary"].strip(), c.get("finding_id"),
+                         json.dumps(c.get("log_refs") or [],
+                                    ensure_ascii=False)))
+                self._append_event_unlocked(
+                    case_id, "created", applicant,
+                    {"report_id": report_id, "version_no": int(version_no),
+                     "claim_count": len(claims)})
+        return self.get_appeal_case(case_id)
+
+    @staticmethod
+    def _appeal_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {"id": row["id"], "batch_id": row["batch_id"],
+                "station": row["station_call"],
+                "report_id": row["report_id"],
+                "version_no": row["version_no"],
+                "status": row["status"], "applicant": row["applicant"],
+                "judge": row["judge"],
+                "version_content_hash": row["version_content_hash"],
+                "report_content_hash": row["report_content_hash"],
+                "binding_content_hash": row["binding_content_hash"],
+                "resolved_version_no": row["resolved_version_no"],
+                "correction_report_id": row["correction_report_id"],
+                "score_before": row["score_before"],
+                "score_after": row["score_after"],
+                "received_ts": row["received_ts"],
+                "accepted_ts": row["accepted_ts"],
+                "withdrawn_ts": row["withdrawn_ts"],
+                "closed_ts": row["closed_ts"]}
+
+    @staticmethod
+    def _claim_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {"id": row["id"], "case_id": row["case_id"],
+                "seq": row["seq"], "subject": row["subject"],
+                "summary": row["summary"], "finding_id": row["finding_id"],
+                "log_refs": json.loads(row["log_refs_json"]),
+                "conclusion": row["conclusion"],
+                "resolution": row["resolution"],
+                "fault_station": row["fault_station"],
+                "penalty_code": row["penalty_code"],
+                "rationale": row["rationale"], "judge": row["judge"]}
+
+    @staticmethod
+    def _event_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {"id": row["id"], "case_id": row["case_id"],
+                "seq": row["seq"], "event_type": row["event_type"],
+                "actor": row["actor"],
+                "detail": json.loads(row["detail_json"]),
+                "created_ts": row["created_ts"]}
+
+    def get_appeal_case(self, case_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM appeal_cases WHERE id = ?",
+            (case_id,)).fetchone()
+        return self._appeal_row(row) if row else None
+
+    def list_appeal_claims(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM appeal_claims WHERE case_id = ? ORDER BY seq",
+            (case_id,)).fetchall()
+        return [self._claim_row(r) for r in rows]
+
+    def list_appeal_events(self, case_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM appeal_events WHERE case_id = ? ORDER BY seq",
+            (case_id,)).fetchall()
+        return [self._event_row(r) for r in rows]
+
+    def list_appeal_cases(self, batch_id: str, *,
+                          status: str | None = None,
+                          station: str | None = None,
+                          report_id: str | None = None
+                          ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM appeal_cases WHERE batch_id = ?"
+        args: list[Any] = [batch_id]
+        if status:
+            sql += " AND status = ?"
+            args.append(status)
+        if station:
+            sql += " AND station_call = ?"
+            args.append(station)
+        if report_id:
+            sql += " AND report_id = ?"
+            args.append(report_id)
+        sql += " ORDER BY received_ts, id"
+        rows = self.conn.execute(sql, args).fetchall()
+        return [self._appeal_row(r) for r in rows]
+
+    def _append_event_unlocked(self, case_id: str, event_type: str,
+                               actor: str | None,
+                               detail: dict[str, Any]) -> None:
+        n = self.conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 n FROM appeal_events "
+            "WHERE case_id = ?", (case_id,)).fetchone()["n"]
+        self.conn.execute(
+            "INSERT INTO appeal_events (id, case_id, seq, event_type, actor, "
+            "detail_json, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (new_id("E"), case_id, n, event_type, actor,
+             json.dumps(detail or {}, ensure_ascii=False), _now()))
+
+    def add_appeal_event(self, case_id: str, event_type: str,
+                         actor: str | None, detail: dict[str, Any]) -> None:
+        with self._lock:
+            with self.conn:
+                self._append_event_unlocked(case_id, event_type, actor, detail)
+
+    def set_appeal_status(self, case_id: str, status: str,
+                          *, judge: str | None = None,
+                          actor: str | None = None,
+                          detail: dict[str, Any] | None = None) -> None:
+        ts_col = {"in_review": "accepted_ts",
+                  "withdrawn": "withdrawn_ts",
+                  "closed": "closed_ts"}.get(status)
+        event = {"in_review": "accepted", "withdrawn": "withdrawn",
+                 "closed": "closed"}.get(status, f"status_{status}")
+        with self._lock:
+            with self.conn:
+                sets = ["status = ?"]
+                args: list[Any] = [status]
+                if ts_col:
+                    sets.append(f"{ts_col} = ?")
+                    args.append(_now())
+                if judge is not None:
+                    sets.append("judge = ?")
+                    args.append(judge)
+                args.append(case_id)
+                self.conn.execute(
+                    f"UPDATE appeal_cases SET {', '.join(sets)} WHERE id = ?",
+                    args)
+                self._append_event_unlocked(case_id, event, actor,
+                                             detail or {})
+
+    def commit_appeal_rulings(self, case_id: str, *,
+                              rulings: list[dict[str, Any]],
+                              annotated_findings: list[dict[str, Any]],
+                              results: dict[str, Any],
+                              rules: dict[str, Any],
+                              version_digest: str,
+                              clock_scheme_slim: dict[str, Any] | None,
+                              score_before: int, score_after: int,
+                              judge: str | None,
+                              note: str | None,
+                              build_correction) -> dict[str, Any]:
+        """确认改判：二次核对全部绑定后一次性写入并冻结新计分版本。
+
+        *build_correction(new_version, snapshot)* 由接口层提供，基于
+        :mod:`cabrillo_judge.feedback` 构建更正包；返回 None 表示无需更正包
+        （得分未变）。任何一项核对失败抛 :class:`AppealStale`，
+        所有写入回滚（整案不写入）。
+        """
+        def stale(code: str, message: str,
+                  bucket: list[dict[str, str]]) -> None:
+            bucket.append({"code": code, "message": message})
+
+        with self._lock:
+            with self.conn:
+                case = self.get_appeal_case(case_id)
+                problems: list[dict[str, str]] = []
+                if case is None:
+                    raise AppealStale([{"code": "CASE_NOT_FOUND",
+                                       "message": f"案件 {case_id} 不存在"}])
+                if case["status"] != "in_review":
+                    stale("CASE_NOT_REVIEWABLE",
+                          f"案件状态为 {case['status']}，仅 in_review 可确认",
+                          problems)
+                report = self.get_feedback_report(case["report_id"])
+                if report is None or report["batch_id"] != case["batch_id"]:
+                    stale("REPORT_NOT_FOUND",
+                          f"绑定反馈包 {case['report_id']} 已不存在", problems)
+                else:
+                    if report["status"] != "published":
+                        stale("REPORT_NOT_PUBLISHED",
+                              f"绑定反馈包 {report['id']} 当前为 "
+                              f"{report['status']}（创建案件时已发布）",
+                              problems)
+                    if report["content_hash"] != case["report_content_hash"]:
+                        stale("REPORT_HASH_MISMATCH",
+                              f"反馈包 {report['id']} 的内容哈希与案件绑定"
+                              f"快照不一致", problems)
+                    if report.get("superseded_by"):
+                        stale("REPORT_SUPERSEDED",
+                              f"反馈包 {report['id']} 已有后续更正包 "
+                              f"{report['superseded_by']}，不自动改绑；"
+                              f"请告知申请方针对最新包重新提案", problems)
+                version = self.get_version(case["batch_id"],
+                                           case["version_no"])
+                if version is None:
+                    stale("VERSION_NOT_FOUND",
+                          f"绑定计分版本 v{case['version_no']} 已不存在",
+                          problems)
+                elif version["content_hash"] != case["version_content_hash"]:
+                    stale("VERSION_HASH_MISMATCH",
+                          f"计分版本 v{case['version_no']} 的内容哈希与案件"
+                          f"绑定快照不一致", problems)
+                latest_no = self.next_version_no(case["batch_id"]) - 1
+                if version is not None and latest_no > case["version_no"]:
+                    stale("VERSION_NOT_LATEST",
+                          f"案件绑定 v{case['version_no']}，但批次已冻结至 "
+                          f"v{latest_no}；绑定快照不再是最新依据，"
+                          f"整案不写入", problems)
+
+                bound_findings = (version["snapshot"].get("findings")
+                                  if version else []) or []
+                bound_index = {f["id"]: f for f in bound_findings}
+                bound_decisions = (version["snapshot"].get("decisions")
+                                   if version else {}) or {}
+
+                # 实时配对与裁决不得相对绑定快照漂移
+                live_rows = self.conn.execute(
+                    "SELECT finding_id, data_json FROM findings "
+                    "WHERE batch_id = ?",
+                    (case["batch_id"],)).fetchall()
+                live_ids = {r["finding_id"] for r in live_rows}
+                bound_ids = set(bound_index)
+                if live_ids != bound_ids:
+                    gone = sorted(bound_ids - live_ids)
+                    added = sorted(live_ids - bound_ids)
+                    stale("PAIRING_STALE",
+                          f"当前配对证据集与绑定快照不一致"
+                          f"（消失 {len(gone)} 条、新增 {len(added)} 条），"
+                          f"绑定依据已失效，整案不写入", problems)
+                live_decisions = self.list_decisions(case["batch_id"])
+                _DEC_KEYS = ("resolution", "fault_station", "penalty_code",
+                             "reason", "judge")
+                for fid in sorted(bound_ids):
+                    a = {k: (live_decisions.get(fid) or {}).get(k)
+                         for k in _DEC_KEYS}
+                    b = {k: (bound_decisions.get(fid) or {}).get(k)
+                         for k in _DEC_KEYS}
+                    if a != b:
+                        stale("DECISION_STALE",
+                              f"证据 {fid} 的现行裁决与绑定快照不一致，"
+                              f"整案不写入", problems)
+
+                # 逐项引用复核：finding 存在/属本台/在报告中；日志行同检
+                claims = self.list_appeal_claims(case_id)
+                if report is not None:
+                    report_data = report.get("report") or {}
+                    entry_lines = {(e.get("filename"), e.get("line"))
+                                   for e in report_data.get("entries", [])}
+                    own_files = {l.get("filename")
+                                 for l in report_data.get("logs", [])}
+                    findings_in_report = {
+                        e.get("finding_id")
+                        for e in report_data.get("entries", [])
+                        if e.get("finding_id")}
+                    findings_in_report |= {
+                        u.get("finding_id")
+                        for u in report_data.get(
+                            "unassociated_evidence", [])
+                        if u.get("finding_id")}
+                    for c in claims:
+                        fid = c.get("finding_id")
+                        if fid:
+                            f = bound_index.get(fid)
+                            if f is None:
+                                stale("FINDING_NOT_IN_BINDING",
+                                      f"争议项 {c['seq']} 引用的证据 {fid} "
+                                      f"不在绑定版本快照中", problems)
+                            else:
+                                if not _appeals.finding_touches_station(
+                                        f, case["station"]):
+                                    stale("CLAIM_STATION_MISMATCH",
+                                          f"争议项 {c['seq']} 引用的证据 "
+                                          f"{fid} 不属于台站 "
+                                          f"{case['station_call']}", problems)
+                                if fid not in findings_in_report:
+                                    stale("TARGET_NOT_IN_REPORT",
+                                          f"争议项 {c['seq']} 的目标证据 "
+                                          f"{fid} 未出现在反馈包中", problems)
+                        for ref in c.get("log_refs") or []:
+                            if ref.get("filename") not in own_files:
+                                stale("CLAIM_STATION_MISMATCH",
+                                      f"争议项 {c['seq']} 引用的日志 "
+                                      f"{ref.get('filename')!r} 不属于台站 "
+                                      f"{case['station_call']}", problems)
+                            elif (ref.get("filename"), ref.get("line")) \
+                                    not in entry_lines:
+                                stale("TARGET_NOT_IN_REPORT",
+                                      f"争议项 {c['seq']} 的目标行 "
+                                      f"{ref.get('filename')}:"
+                                      f"{ref.get('line')} 未出现在反馈包中",
+                                      problems)
+
+                if problems:
+                    raise AppealStale(problems)
+
+                # ---- 全部核对通过：一次性写入 ---------------------------
+                rulings_by_id = {r["claim_id"]: r for r in rulings}
+                changed_fids: set[str] = set()
+                for c in claims:
+                    r = rulings_by_id.get(c["id"])
+                    if not r:
+                        continue
+                    fault = r.get("fault_station")
+                    fault = str(fault).upper() if fault else None
+                    self.conn.execute(
+                        "UPDATE appeal_claims SET conclusion = ?, "
+                        "resolution = ?, fault_station = ?, penalty_code = ?, "
+                        "rationale = ?, judge = ? WHERE id = ?",
+                        (r.get("conclusion"),
+                         (str(r.get("resolution") or "").upper()
+                          if r.get("resolution") else None),
+                         fault, r.get("penalty_code"),
+                         str(r.get("rationale") or "").strip() or None,
+                         r.get("judge"), c["id"]))
+                    if r.get("conclusion") == "revised" and c["finding_id"]:
+                        changed_fids.add(c["finding_id"])
+                        self.conn.execute(
+                            "INSERT INTO decisions (batch_id, finding_id, "
+                            "resolution, fault_station, penalty_code, reason, "
+                            "judge, updated_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                            "ON CONFLICT(batch_id, finding_id) DO UPDATE SET "
+                            "resolution=excluded.resolution, "
+                            "fault_station=excluded.fault_station, "
+                            "penalty_code=excluded.penalty_code, "
+                            "reason=excluded.reason, judge=excluded.judge, "
+                            "updated_ts=excluded.updated_ts",
+                            (case["batch_id"], c["finding_id"],
+                             str(r.get("resolution") or "").upper(),
+                             fault, r.get("penalty_code"),
+                             str(r.get("rationale") or "").strip(),
+                             r.get("judge"), _now()))
+
+                new_no = None
+                digest = None
+                correction_id = None
+                # 有改判项时才重写证据/冻结新计分版本；纯维持/证据不足案件
+                # 不改批次数据，直接结案
+                if changed_fids:
+                    self.conn.execute(
+                        "DELETE FROM findings WHERE batch_id = ?",
+                        (case["batch_id"],))
+                    self.conn.executemany(
+                        "INSERT INTO findings (batch_id, finding_id, data_json) "
+                        "VALUES (?, ?, ?)",
+                        [(case["batch_id"], f["id"],
+                          json.dumps(f, ensure_ascii=False))
+                         for f in annotated_findings])
+
+                    new_no = self.next_version_no(case["batch_id"])
+                    submissions = self.get_submissions(case["batch_id"])
+                    log_manifest = [{
+                        "log_id": s["log_id"], "filename": s["filename"],
+                        "station_call": s["station_call"],
+                        "upload_ts": s["upload_ts"]} for s in submissions]
+                    active_scheme = self.get_active_clock_scheme(
+                        case["batch_id"])
+                    scheme_for_hash = clock_scheme_slim
+                    if active_scheme is not None and clock_scheme_slim is None:
+                        scheme_for_hash = {
+                            "reference_log_id":
+                            active_scheme["reference_log_id"],
+                            "max_window_seconds":
+                            active_scheme["max_window_seconds"],
+                            "offsets": active_scheme["offsets"]}
+                    digest = content_hash(
+                        rules, annotated_findings,
+                        self.list_decisions(case["batch_id"]),
+                        results, clock_scheme=scheme_for_hash)
+                    snapshot = {
+                        "batch_id": case["batch_id"], "version_no": new_no,
+                        "content_hash": digest,
+                        "batch_name":
+                        self.get_batch(case["batch_id"])["name"],
+                        "rules": rules,
+                        "decisions": self.list_decisions(case["batch_id"]),
+                        "findings": annotated_findings, "results": results,
+                        "logs": log_manifest,
+                        "clock_scheme": ({**scheme_for_hash,
+                                          "id": active_scheme["id"],
+                                          "name": active_scheme["name"]}
+                                         if active_scheme else None),
+                        "created_by_appeal": case_id,
+                        "created_ts": _now()}
+                    self.conn.execute(
+                        "INSERT INTO versions (batch_id, version_no, "
+                        "content_hash, note, snapshot_json, created_ts) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (case["batch_id"], new_no, digest, note,
+                         json.dumps(snapshot, ensure_ascii=False), _now()))
+
+                    # 得分变化时生成沿用既有替代关系的更正包
+                    if build_correction is not None \
+                            and score_after != score_before:
+                        new_version = {"version_no": new_no,
+                                       "content_hash": digest,
+                                       "note": note,
+                                       "created_ts": snapshot["created_ts"],
+                                       "snapshot": snapshot}
+                        corr = build_correction(new_version, snapshot)
+                        if corr is not None:
+                            corr_digest = _feedback.report_content_hash(corr)
+                            existing = self.find_feedback_by_hash(
+                                case["batch_id"], case["station"],
+                                corr_digest)
+                            if existing:
+                                correction_id = existing["id"]
+                            else:
+                                correction_id = new_id("R")
+                                self.conn.execute(
+                                    "INSERT INTO feedback_reports (id, "
+                                    "batch_id, station_call, version_no, kind, "
+                                    "status, content_hash, corrects_report_id, "
+                                    "corrects_version_no, report_json, "
+                                    "external_json, previewed_ts, "
+                                    "published_ts, created_ts) VALUES "
+                                    "(?, ?, ?, ?, 'correction', 'published', "
+                                    "?, ?, ?, ?, ?, ?, ?, ?)",
+                                    (correction_id, case["batch_id"],
+                                     case["station"], new_no, corr_digest,
+                                     report["id"], report["version_no"],
+                                     json.dumps(corr, ensure_ascii=False),
+                                     json.dumps(
+                                         _feedback.build_external_report(corr),
+                                         ensure_ascii=False),
+                                     _now(), _now(), _now()))
+                                self.conn.execute(
+                                    "UPDATE feedback_reports SET "
+                                    "superseded_by = ? WHERE id = ?",
+                                    (correction_id, report["id"]))
+                            self._append_event_unlocked(
+                                case_id, "correction_published", judge,
+                                {"report_id": correction_id,
+                                 "supersedes": report["id"],
+                                 "version_no": new_no})
+
+                self.conn.execute(
+                    "UPDATE appeal_cases SET status = 'closed', judge = ?, "
+                    "resolved_version_no = ?, correction_report_id = ?, "
+                    "score_before = ?, score_after = ?, closed_ts = ? "
+                    "WHERE id = ?",
+                    (judge, new_no, correction_id, score_before, score_after,
+                     _now(), case_id))
+                self._append_event_unlocked(
+                    case_id, "ruled", judge,
+                    {"revised": sorted(changed_fids),
+                     "revision_count": len(changed_fids),
+                     "score_before": score_before,
+                     "score_after": score_after})
+                if new_no is not None:
+                    self._append_event_unlocked(
+                        case_id, "version_frozen", judge,
+                        {"version_no": new_no, "content_hash": digest})
+                self._append_event_unlocked(case_id, "closed", judge, {})
+                return {"version_no": new_no, "content_hash": digest,
+                        "frozen": new_no is not None,
+                        "correction_report_id": correction_id,
+                        "score_before": score_before,
+                        "score_after": score_after}
+
+
+class AppealStale(Exception):
+    """确认时绑定快照已失效（引用/哈希对不上）；整案不写入。"""
+
+    def __init__(self, problems: list[dict[str, str]]):
+        self.problems = problems
+        super().__init__("；".join(p["message"] for p in problems))

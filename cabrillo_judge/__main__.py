@@ -249,6 +249,57 @@ def seed_feedback_demo(storage: Storage, bid: str) -> bool:
     return True
 
 
+def seed_appeal_demo(storage: Storage, bid: str) -> bool:
+    """为示例赛事创建一条赛后复议案件示例（submitted，未受理）。
+
+    以已发布的 BG1AAA 反馈包为对象，示例两项主张：配对状态（EXCHANGE_DIFF）
+    与原日志行（DUP）。已存在案件时幂等跳过。
+    """
+    from .appeals import case_content_hash, validate_claims
+
+    rep = storage.latest_published_feedback(bid, "BG1AAA")
+    if rep is None:
+        return False
+    if storage.list_appeal_cases(bid, station="BG1AAA",
+                                 report_id=rep["id"]):
+        return False
+    version = storage.get_version(bid, rep["version_no"])
+    entries = rep["report"]["entries"]
+    ex_entry = next((e for e in entries
+                     if e["status"] == "EXCHANGE_DIFF"), None)
+    dup_entry = next((e for e in entries if e["status"] == "DUP"), None)
+    if ex_entry is None or dup_entry is None:
+        return False
+    claims = [
+        {"id": new_id("CL"), "subject": "pairing_status",
+         "summary": "申请方称第 %d 行与对方实为同一通联，交换差异系抄收"
+                    "笔误，请求确认计分" % ex_entry["line"],
+         "finding_id": ex_entry["finding_id"], "log_refs": [
+             {"filename": ex_entry["filename"], "line": ex_entry["line"]}]},
+        {"id": new_id("CL"), "subject": "log_line",
+         "summary": "申请方主张第 %d 行为有效独立通联，不构成重复"
+                    % dup_entry["line"],
+         "finding_id": dup_entry["finding_id"], "log_refs": [
+             {"filename": dup_entry["filename"], "line": dup_entry["line"]}]},
+    ]
+    problems = validate_claims(
+        claims, station="BG1AAA", report=rep["report"],
+        version_snapshot=version["snapshot"])
+    if any(problems):  # 示例数据必须合法
+        raise RuntimeError(f"示例复议案件校验失败: {problems}")
+    binding_hash = case_content_hash(
+        report_id=rep["id"], station="BG1AAA",
+        version_no=rep["version_no"],
+        version_content_hash=version["content_hash"],
+        report_content_hash=rep["content_hash"], claims=claims)
+    cid = new_id("CASE")
+    storage.create_appeal_case(
+        cid, bid, "BG1AAA", rep["id"], rep["version_no"],
+        version["content_hash"], rep["content_hash"], binding_hash,
+        claims, applicant="BG1AAA")
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="python -m cabrillo_judge",
@@ -271,10 +322,12 @@ def main(argv: list[str] | None = None) -> int:
     bid = None
     skew_bid = None
     feedback_seeded = False
+    appeal_seeded = False
     if args.demo or args.reset_demo:
         bid = seed_demo(server.storage, reset=args.reset_demo)  # type: ignore[attr-defined]
         skew_bid = seed_clock_demo(server.storage)  # type: ignore[attr-defined]
         feedback_seeded = seed_feedback_demo(server.storage, bid)  # type: ignore[attr-defined]
+        appeal_seeded = seed_appeal_demo(server.storage, bid)  # type: ignore[attr-defined]
 
     print("=" * 64)
     print(f"{DOC_TITLE}")
@@ -289,6 +342,11 @@ def main(argv: list[str] | None = None) -> int:
         if feedback_seeded:
             print("  （已冻结计分版本 1；BG1AAA 的反馈包已预览并发布，"
                   "其余为草稿）")
+        if appeal_seeded:
+            print("赛后复议示例: 一条针对 BG1AAA 已发布反馈包的案件"
+                  "（submitted）")
+            print(f"  GET http://{args.host}:{args.port}"
+                  f"/api/batches/{bid}/appeals")
     if skew_bid:
         print(f"时钟偏差示例: 批次 {skew_bid}")
         print(f"  GET http://{args.host}:{args.port}/api/batches/{skew_bid}"

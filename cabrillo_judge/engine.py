@@ -39,6 +39,47 @@ PENDING_STATUSES = {"EXCHANGE_DIFF", "TIME_DRIFT", "SUSPECT_CALL",
 # Resolution values a judge may record on a decision.
 RESOLUTIONS = {"CONFIRMED", "REMOVED", "GRANTED", "WAIVED"}
 
+# 各配对状态允许的裁决动作（普通裁决与赛后复议改判共用同一口径）
+RESOLUTION_ALLOWED: dict[str, set[str]] = {
+    "EXCHANGE_DIFF": {"CONFIRMED", "REMOVED"},
+    "TIME_DRIFT": {"CONFIRMED", "REMOVED"},
+    "SUSPECT_CALL": {"CONFIRMED", "REMOVED"},
+    "NO_PARTNER_LOG": {"GRANTED", "WAIVED", "REMOVED"},
+    "UNIQUE": {"WAIVED", "REMOVED", "GRANTED"},
+    "DUP": {"WAIVED", "REMOVED"},
+    "MATCH": {"REMOVED"},
+}
+
+
+def validate_judge_decision(rules: dict[str, Any], finding: dict[str, Any],
+                            *, resolution: str, reason: str,
+                            fault_station: str | None = None,
+                            penalty_code: str | None = None) -> list[str]:
+    """校验一条裁决；返回中文问题清单（空列表表示合法）。"""
+    problems: list[str] = []
+    if resolution not in RESOLUTIONS:
+        return [f"resolution 必须是 {sorted(RESOLUTIONS)} 之一"]
+    if not reason or not str(reason).strip():
+        problems.append("裁决必须填写理由 reason")
+    allowed = RESOLUTION_ALLOWED.get(finding["status"], set())
+    if resolution not in allowed:
+        problems.append(
+            f"{finding['status']} 状态只接受 {sorted(allowed)}")
+    if fault_station is not None:
+        fault = str(fault_station).upper()
+        if fault not in finding.get("stations", []) and not (
+                finding.get("refs") and
+                finding["refs"][0].get("station") == fault):
+            problems.append(
+                f"fault_station 必须是相关台站之一: "
+                f"{finding.get('stations')}")
+    if penalty_code is not None and \
+            penalty_code not in rules.get("penalties", {}):
+        problems.append(
+            f"penalty_code 必须在规则罚分目录中: "
+            f"{sorted(rules.get('penalties', {}))}")
+    return problems
+
 
 # ---------------------------------------------------------------------------
 # Fuzzy callsign comparison

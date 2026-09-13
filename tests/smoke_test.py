@@ -963,6 +963,458 @@ check("呼号与行号文本不误伤",
       _sanitize_text("BG1AAA 第 14 行抄收 559，对方实发 599")
       == "BG1AAA 第 14 行抄收 559，对方实发 599")
 
+# --- HTTP 层：赛后复议案件 ---------------------------------------------------
+from cabrillo_judge.appeals import (
+    CASE_STATUSES, case_content_hash, validate_claims, apply_rulings,
+    validate_rulings, preview_digest, outcome_scorecard_diff,
+    finding_touches_station)
+from cabrillo_judge.engine import content_hash
+
+with tempfile.TemporaryDirectory() as d:
+    server = make_server("127.0.0.1", 0, os.path.join(d, "t.db"))
+    port = server.server_address[1]
+    th = threading.Thread(target=server.serve_forever, daemon=True)
+    th.start()
+
+    def api3(method, path, body=None, raw=False):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        payload = json.dumps(body).encode() if body is not None else None
+        headers = {"Content-Type": "application/json"} if body else {}
+        conn.request(method, path, body=payload, headers=headers)
+        resp = conn.getresponse()
+        data = resp.read().decode()
+        conn.close()
+        return (resp.status, data) if raw else (resp.status, json.loads(data))
+
+    st_code, r = api3("POST", "/api/batches", {"name": "appeal-http"})
+    abid = r["batch"]["id"]
+    api3("POST", f"/api/batches/{abid}/logs", {"logs": [
+        {"filename": "BG1AAA.log", "content": DEMO_LOG_A},
+        {"filename": "BG2BBB.log", "content": DEMO_LOG_B},
+        {"filename": "BG3CCC.log", "content": DEMO_LOG_C}]})
+    api3("POST", f"/api/batches/{abid}/versions", {"note": "v1"})
+    # 发布 BG1AAA 的 v1 反馈包
+    st_code, r = api3("POST", f"/api/batches/{abid}/feedback",
+                      {"version_no": 1, "station": "BG1AAA"})
+    rid_a = r["reports"][0]["report"]["id"]
+    api3("POST", f"/api/batches/{abid}/feedback/{rid_a}/preview")
+    api3("POST", f"/api/batches/{abid}/feedback/{rid_a}/publish")
+    # BG2BBB 的草稿包（不可复议）
+    st_code, r = api3("POST", f"/api/batches/{abid}/feedback",
+                      {"version_no": 1, "station": "BG2BBB"})
+    rid_b_draft = r["reports"][0]["report"]["id"]
+
+    st_code, r = api3("POST", f"/api/batches/{abid}/appeals",
+                      {"report_id": rid_b_draft,
+                       "claims": [{"subject": "summary_score",
+                                   "summary": "草稿有问题"}]})
+    check("复议：草稿包不可提案", st_code == 409
+          and r["error"] == "FEEDBACK_NOT_PUBLISHED", str(r)[:200])
+
+    # 取 EXCHANGE_DIFF（第14行）与 DUP（第17行）证据
+    st_code, r = api3("GET",
+                      f"/api/batches/{abid}/findings?status=EXCHANGE_DIFF")
+    fid_ex = r["findings"][0]["id"]
+    st_code, r = api3("GET", f"/api/batches/{abid}/findings?status=DUP")
+    fid_dup = r["findings"][0]["id"]
+
+    # 引用校验：他台 finding / 他台日志行 / 不存在的行 / 无罚分目标
+    st_code, r = api3("POST", f"/api/batches/{abid}/appeals", {
+        "report_id": rid_a, "claims": [
+            {"subject": "pairing_status", "summary": "不存在的证据",
+             "finding_id": "F-deadbeefdead"},
+            {"subject": "log_line", "summary": "他台行",
+             "log_refs": [{"filename": "BG2BBB.log", "line": 8}]},
+            {"subject": "log_line", "summary": "不存在的行",
+             "log_refs": [{"filename": "BG1AAA.log", "line": 99}]},
+            {"subject": "penalty", "summary": "无罚分目标",
+             "finding_id": fid_ex},
+            {"subject": "exchange_diff", "summary": "缺引用"}]})
+    check("复议：非法引用被逐项拒绝且不自动改绑",
+          st_code == 400 and r["error"] == "INVALID_CLAIMS"
+          and len(r["details"]) == 5
+          and any(p["code"] == "CLAIM_FINDING_NOT_FOUND"
+                  for p in r["details"][0]["problems"])
+          and any(p["code"] == "CLAIM_STATION_MISMATCH"
+                  for p in r["details"][1]["problems"])
+          and any(p["code"] == "TARGET_NOT_IN_REPORT"
+                  for p in r["details"][2]["problems"])
+          and any(p["code"] == "TARGET_NO_PENALTY"
+                  for p in r["details"][3]["problems"])
+          and any(p["code"] == "CLAIM_TARGET_REQUIRED"
+                  for p in r["details"][4]["problems"]),
+          json.dumps(r, ensure_ascii=False)[:500])
+
+    # 合法案件创建
+    st_code, r = api3("POST", f"/api/batches/{abid}/appeals", {
+        "report_id": rid_a, "applicant": "BG1AAA", "claims": [
+            {"subject": "pairing_status",
+             "summary": "第14行交换差异系抄收笔误，请求确认计分",
+             "finding_id": fid_ex,
+             "log_refs": [{"filename": "BG1AAA.log", "line": 14}]},
+            {"subject": "log_line",
+             "summary": "第17行不构成重复",
+             "finding_id": fid_dup,
+             "log_refs": [{"filename": "BG1AAA.log", "line": 17}]}]})
+    check("复议：合法案件创建（submitted）", st_code == 201
+          and r["case"]["status"] == "submitted"
+          and r["case"]["report_id"] == rid_a
+          and r["case"]["version_no"] == 1
+          and len(r["binding"]["binding_content_hash"]) == 64
+          and len(r["claims"]) == 2, str(r)[:200])
+    cid = r["case"]["id"]
+    binding_hash = r["binding"]["binding_content_hash"]
+
+    st_code, r = api3("POST", f"/api/batches/{abid}/appeals", {
+        "report_id": rid_a,
+        "claims": [{"subject": "summary_score", "summary": "重复提案"}]})
+    check("复议：同一未结案件期间禁止重复提案",
+          st_code == 409 and r["error"] == "APPEAL_ALREADY_EXISTS",
+          str(r)[:160])
+
+    # 详情含绑定快照与状态轨迹
+    st_code, r = api3("GET", f"/api/batches/{abid}/appeals/{cid}")
+    check("复议：详情含争议项/轨迹/绑定",
+          st_code == 200 and [c["seq"] for c in r["claims"]] == [1, 2]
+          and [e["event_type"] for e in r["events"]] == ["created"]
+          and r["binding"]["report"]["id"] == rid_a
+          and r["binding"]["version"]["version_no"] == 1, str(r)[:200])
+
+    # 未受理不能预览/确认；可以且仅可以撤回
+    st_code, r = api3("POST", f"/api/batches/{abid}/appeals/{cid}/preview",
+                      {"rulings": []})
+    check("复议：未受理不能预览", st_code == 409
+          and r["error"] == "APPEAL_NOT_IN_REVIEW", str(r)[:120])
+
+    # 撤回
+    st_code, r = api3("POST", f"/api/batches/{abid}/appeals/{cid}/withdraw",
+                      {"reason": "申请方补充材料后重新提交",
+                       "applicant": "BG1AAA"})
+    check("复议：未受理案件可撤回", st_code == 200
+          and r["case"]["status"] == "withdrawn"
+          and r["case"]["withdrawn_ts"] is not None, str(r)[:200])
+    st_code, r = api3("POST", f"/api/batches/{abid}/appeals/{cid}/accept",
+                      {"judge": "甲"})
+    check("复议：撤回后不能受理", st_code == 409, str(r)[:120])
+    st_code, r = api3("GET",
+                      f"/api/batches/{abid}/appeals?status=withdrawn")
+    check("复议：状态筛选 withdrawn",
+          r["count"] == 1 and r["cases"][0]["id"] == cid, str(r)[:160])
+
+    # 撤回后可重新提案
+    st_code, r = api3("POST", f"/api/batches/{abid}/appeals", {
+        "report_id": rid_a, "claims": [
+            {"subject": "pairing_status", "summary": "重新提案",
+             "finding_id": fid_ex}]})
+    check("复议：撤回后可重新提案", st_code == 201
+          and r["case"]["status"] == "submitted", str(r)[:160])
+    cid2 = r["case"]["id"]
+
+    # 受理
+    st_code, r = api3("POST", f"/api/batches/{abid}/appeals/{cid2}/accept",
+                      {"judge": "裁判甲"})
+    check("复议：受理成功 in_review", st_code == 200
+          and r["case"]["status"] == "in_review"
+          and r["case"]["judge"] == "裁判甲", str(r)[:160])
+    st_code, r = api3("POST", f"/api/batches/{abid}/appeals/{cid2}/withdraw",
+                      {"reason": "受理后不能撤"})
+    check("复议：受理后不能撤回", st_code == 409
+          and r["error"] == "APPEAL_NOT_WITHDRAWABLE", str(r)[:120])
+
+    st_code, r = api3("GET", f"/api/batches/{abid}/appeals/{cid2}")
+    claim_ids = [c["id"] for c in r["claims"]]
+    check("复议：重新提案仅含 1 个争议项", len(claim_ids) == 1)
+    rulings_bad = [
+        {"claim_id": claim_ids[0], "conclusion": "revised",
+         "resolution": "WAIVED", "rationale": "EXCHANGE_DIFF 不允许 WAIVED"},
+        {"claim_id": "nope", "conclusion": "upheld", "rationale": "悬挂结论"}]
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid2}/preview",
+                      {"rulings": rulings_bad})
+    check("复议：结论形式校验（动作与状态不符/悬挂项）",
+          st_code == 400 and r["error"] == "INVALID_RULINGS"
+          and any(d["claim_id"] == "__ruling_nope" for d in r["details"])
+          and any(p["code"] == "BAD_DECISION"
+                  for d in r["details"] if d["claim_id"] == claim_ids[0]
+                  for p in d["problems"]),
+          json.dumps(r, ensure_ascii=False)[:400])
+    # 缺结论项也必须报错
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid2}/preview",
+                      {"rulings": []})
+    check("复议：空结论列表 400", st_code == 400
+          and r["error"] == "RULINGS_REQUIRED", str(r)[:120])
+
+    # 合法预览：仅 1 项改判 CONFIRMED+罚 BG1AAA
+    rulings = [
+        {"claim_id": claim_ids[0], "conclusion": "revised",
+         "resolution": "CONFIRMED", "fault_station": "BG1AAA",
+         "penalty_code": "BAD_EXCHANGE",
+         "rationale": "交换差异为台站抄收笔误，通联确认计分并罚抄收错误",
+         "judge": "裁判甲"}]
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid2}/preview",
+                      {"rulings": rulings, "judge": "裁判甲"})
+    check("复议：处理预览给出变更与计分",
+          st_code == 200 and r["revision_count"] == 1
+          and r["station_score"] == {"station": "BG1AAA", "before": 1,
+                                     "after": 0, "delta": -1}
+          and r["correction_required"] is True
+          and r["prospective_version_no"] == 2
+          and len(r["digest"]) == 64
+          and r["items"][0]["conclusion"] == "revised"
+          and r["items"][0]["after"]["counted"] is True
+          and r["items"][0]["after"]["penalty_points"] == 2,
+          json.dumps(r, ensure_ascii=False)[:300])
+    digest = r["digest"]
+    check("复议：预览不写入（版本仍为 1、案件仍 in_review）",
+          len(api3("GET", f"/api/batches/{abid}/versions")[1]["versions"]) == 1)
+
+    # 无 digest / digest 不符拒绝确认
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid2}/confirm",
+                      {"rulings": rulings})
+    check("复议：无预览 digest 不能确认", st_code == 400
+          and r["error"] == "PREVIEW_REQUIRED", str(r)[:120])
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid2}/confirm",
+                      {"rulings": rulings, "digest": "0" * 64})
+    check("复议：digest 不符拒绝确认", st_code == 409
+          and r["error"] == "PREVIEW_DIGEST_MISMATCH", str(r)[:120])
+
+    # 绑定漂移：确认前改动另一条证据裁决 -> 整案不写入
+    st_code, r = api3("GET",
+                      f"/api/batches/{abid}/findings?status=NO_PARTNER_LOG")
+    fid_npl = r["findings"][0]["id"]
+    api3("POST", f"/api/batches/{abid}/findings/{fid_npl}/decision",
+         {"resolution": "GRANTED",
+          "reason": "赛后另行改判，使绑定快照漂移"})
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid2}/confirm",
+                      {"rulings": rulings, "digest": digest})
+    check("复议：绑定失效时整案不写入（APPEAL_STALE）",
+          st_code == 409 and r["error"] == "APPEAL_STALE"
+          and any(p["code"] == "DECISION_STALE" for p in r["details"])
+          and any("整案不写入" in p["message"] for p in r["details"]),
+          json.dumps(r, ensure_ascii=False)[:300])
+    st_code, r = api3("GET", f"/api/batches/{abid}/appeals/{cid2}")
+    check("复议：失败后案件仍 in_review、版本未增加",
+          r["case"]["status"] == "in_review"
+          and len(api3("GET", f"/api/batches/{abid}/versions")[1]
+                  ["versions"]) == 1)
+
+    # 撤销那条漂移裁决后确认成功（一次性写入并冻结 v2）
+    api3("DELETE", f"/api/batches/{abid}/findings/{fid_npl}/decision")
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid2}/confirm",
+                      {"rulings": rulings, "digest": digest,
+                       "judge": "裁判甲", "note": "复议改判冻结"})
+    check("复议：确认成功并结案",
+          st_code == 200 and r["case"]["status"] == "closed"
+          and r["frozen"] is True
+          and r["frozen_version"]["version_no"] == 2
+          and r["case"]["resolved_version_no"] == 2
+          and r["case"]["score_before"] == 1
+          and r["case"]["score_after"] == 0, str(r)[:300])
+    corr_id = r["correction_published"]
+    check("复议：得分变化生成更正包", bool(corr_id))
+    check("复议：逐项结论落库",
+          [(c["seq"], c["conclusion"], c["resolution"]) for c in r["claims"]]
+          == [(1, "revised", "CONFIRMED")])
+    check("复议：状态轨迹完整",
+          [e["event_type"] for e in r["events"]]
+          == ["created", "accepted", "correction_published", "ruled",
+              "version_frozen", "closed"],
+          str([e["event_type"] for e in r["events"]]))
+
+    # 新裁决实际进入批次：v2 结果与现行 results 一致
+    st_code, r = api3("GET", f"/api/batches/{abid}/results")
+    card_a = next(c for c in r["scorecards"] if c["station"] == "BG1AAA")
+    check("复议：改判写入后现行计分卡为改判后结果",
+          card_a["total_score"] == 0 and card_a["penalty_points"] == 2
+          and card_a["qso_counted"] == 2, json.dumps(card_a, ensure_ascii=False))
+    st_code, r = api3("GET", f"/api/batches/{abid}/versions/2")
+    check("复议：v2 快照标注来源案件且含新裁决",
+          r["snapshot"].get("created_by_appeal") == cid2
+          and r["snapshot"]["decisions"][fid_ex]["resolution"]
+          == "CONFIRMED", str(r["snapshot"].get("created_by_appeal")))
+
+    # 原反馈包不可变，仅记录 superseded_by
+    st_code, r = api3("GET", f"/api/batches/{abid}/feedback/{rid_a}")
+    check("复议：原反馈包内容不可变且记录替代",
+          r["report"]["status"] == "published"
+          and r["report"]["superseded_by"] == corr_id
+          and r["content"]["summary"]["final_score"] == 1)
+
+    # 更正包为已发布、沿既有替代关系、对外稿就绪
+    st_code, r = api3("GET", f"/api/batches/{abid}/feedback/{corr_id}")
+    check("复议：更正包已发布且注明旧包/版本/分差",
+          r["report"]["kind"] == "correction"
+          and r["report"]["status"] == "published"
+          and r["report"]["version_no"] == 2
+          and r["report"]["corrects_report_id"] == rid_a
+          and r["content"]["correction"]["score_delta"] == -1
+          and r["content"]["summary"]["final_score"] == 0,
+          json.dumps(r["report"], ensure_ascii=False)[:300])
+    st_code, txt = api3(
+        "GET",
+        f"/api/batches/{abid}/feedback/{corr_id}/download?format=txt",
+        raw=True)
+    check("复议：更正包发布即可下载对外纯文本",
+          st_code == 200 and "更正包" in txt and "脱敏说明" in txt,
+          txt[:100])
+
+    # 对已被替代的旧包再提案 -> 明确拒绝且不自动改绑
+    st_code, r = api3("POST", f"/api/batches/{abid}/appeals", {
+        "report_id": rid_a,
+        "claims": [{"subject": "summary_score", "summary": "旧包异议"}]})
+    check("复议：已被替代的旧包拒绝受理",
+          st_code == 409 and r["error"] == "REPORT_SUPERSEDED"
+          and corr_id in r["message"] and "不会自动改绑" in r["message"],
+          r["message"][:120])
+
+    # 结案后下载案件 JSON
+    st_code, r = api3("GET",
+                      f"/api/batches/{abid}/appeals/{cid2}/download")
+    check("复议：JSON 下载含导出信封/案件/争议/轨迹/结果",
+          r["export"] == "cabrillo-judge-appeal"
+          and r["schema_version"] == 1
+          and r["case"]["id"] == cid2
+          and r["outcome"]["correction_report"]["id"] == corr_id
+          and len(r["claims"]) == 1 and len(r["events"]) == 6,
+          str(list(r.keys())))
+
+    # 筛选：station/report_id
+    st_code, r = api3("GET",
+                      f"/api/batches/{abid}/appeals?station=BG1AAA")
+    check("复议：按台站筛选", r["count"] == 2
+          and {c["status"] for c in r["cases"]} == {"withdrawn", "closed"})
+    st_code, r = api3(
+        "GET", f"/api/batches/{abid}/appeals?report_id={rid_a}")
+    check("复议：按反馈包筛选", r["count"] == 2)
+    st_code, r = api3("GET",
+                      f"/api/batches/{abid}/appeals?status=bogus")
+    check("复议：非法状态 400", st_code == 400
+          and r["error"] == "BAD_STATUS")
+
+    # --- 纯维持/证据不足：不改判不冻结版本、不出更正包，直接结案 ---------
+    st_code, r = api3("POST", f"/api/batches/{abid}/feedback",
+                      {"version_no": 2, "station": "BG2BBB"})
+    rid_b = r["reports"][0]["report"]["id"]
+    api3("POST", f"/api/batches/{abid}/feedback/{rid_b}/preview")
+    api3("POST", f"/api/batches/{abid}/feedback/{rid_b}/publish")
+    st_code, r = api3("POST", f"/api/batches/{abid}/appeals", {
+        "report_id": rid_b, "claims": [
+            {"subject": "summary_score", "summary": "对分数有疑问"}]})
+    cid3 = r["case"]["id"]
+    api3("POST", f"/api/batches/{abid}/appeals/{cid3}/accept",
+         {"judge": "乙"})
+    st_code, dcase = api3("GET", f"/api/batches/{abid}/appeals/{cid3}")
+    rulings3 = [{"claim_id": dcase["claims"][0]["id"],
+                 "conclusion": "upheld", "rationale": "复核后维持"}]
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid3}/preview",
+                      {"rulings": rulings3})
+    check("复议：纯维持预览无改判无分差",
+          r["revision_count"] == 0
+          and r["correction_required"] is False
+          and r["station_score"]["delta"] == 0)
+    dg = r["digest"]
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid3}/confirm",
+                      {"rulings": rulings3, "digest": dg})
+    check("复议：纯维持结案但不冻结新版本/不出更正包",
+          r["case"]["status"] == "closed" and r["frozen"] is False
+          and r["frozen_version"] is None
+          and r["correction_published"] is None
+          and r["case"]["resolved_version_no"] is None, str(r)[:200])
+    check("复议：版本数仍为 2",
+          len(api3("GET", f"/api/batches/{abid}/versions")[1]
+              ["versions"]) == 2)
+
+    server.shutdown()
+    server.server_close()
+
+# --- 复议：领域层单元（绑定哈希/预览确定性/改判应用） -------------------------
+with tempfile.TemporaryDirectory() as d:
+    st = Storage(os.path.join(d, "t.db"))
+    b = st.create_batch(new_id("B"), "appeal-unit", rules)
+    bid = b["id"]
+    pa = parse_cabrillo(DEMO_LOG_A, rules)
+    pb = parse_cabrillo(DEMO_LOG_B, rules)
+    pc = parse_cabrillo(DEMO_LOG_C, rules)
+    st.add_log("LA", bid, "BG1AAA.log", DEMO_LOG_A, pa)
+    st.add_log("LB", bid, "BG2BBB.log", DEMO_LOG_B, pb)
+    st.add_log("LC", bid, "BG3CCC.log", DEMO_LOG_C, pc)
+    computed = adjudicate(rules, st.get_submissions(bid))["findings"]
+    st.replace_findings(bid, apply_decisions(rules, computed, {}))
+    raw = st.list_findings(bid)
+    annotated = apply_decisions(rules, raw, {})
+    results = score(rules, annotated)
+    digest = content_hash(rules, annotated, {}, results)
+    vno = st.next_version_no(bid)
+    st.save_version(bid, vno, digest, "v1", {
+        "batch_id": bid, "version_no": vno, "content_hash": digest,
+        "batch_name": "appeal-unit", "rules": rules, "decisions": {},
+        "findings": annotated, "results": results,
+        "logs": [{"log_id": s["log_id"], "filename": s["filename"],
+                  "station_call": s["station_call"],
+                  "upload_ts": s["upload_ts"]}
+                 for s in st.get_submissions(bid)],
+        "clock_scheme": None, "created_ts": 1})
+    version = st.get_version(bid, vno)
+    submissions = st.get_submissions(bid)
+    from cabrillo_judge.feedback import build_station_report
+    report = build_station_report(
+        batch=b, version=version, station="BG1AAA",
+        logs=[s for s in submissions if s["station_call"] == "BG1AAA"])
+    fid = next(f["id"] for f in annotated if f["status"] == "EXCHANGE_DIFF")
+    claims = [{"id": "CL-1", "subject": "pairing_status",
+               "summary": "s", "finding_id": fid,
+               "log_refs": [{"filename": "BG1AAA.log", "line": 14}]}]
+    probs = validate_claims(
+        claims, station="BG1AAA", report=report,
+        version_snapshot=version["snapshot"])
+    check("复议领域：合法引用无问题", probs == [[]], str(probs))
+    h1 = case_content_hash(
+        report_id="R1", station="BG1AAA", version_no=1,
+        version_content_hash=digest,
+        report_content_hash="h" * 64, claims=claims)
+    h2 = case_content_hash(
+        report_id="R1", station="BG1AAA", version_no=1,
+        version_content_hash=digest,
+        report_content_hash="h" * 64, claims=claims)
+    h3 = case_content_hash(
+        report_id="R1", station="BG1AAA", version_no=1,
+        version_content_hash=digest,
+        report_content_hash="x" * 64, claims=claims)
+    check("复议领域：绑定哈希稳定且随内容变化", h1 == h2 and h1 != h3)
+    rulings = [{"claim_id": "CL-1", "conclusion": "revised",
+                "resolution": "CONFIRMED", "fault_station": "BG1AAA",
+                "penalty_code": "BAD_EXCHANGE", "rationale": "r"}]
+    vr = validate_rulings(
+        claims, rulings, rules=rules,
+        findings_index={f["id"]: f for f in annotated})
+    check("复议领域：改判结论形式合法", vr == {"CL-1": []}, str(vr))
+    outcome = apply_rulings(
+        rules=rules, station="BG1AAA", claims=claims,
+        rulings=rulings, snapshot=version["snapshot"])
+    check("复议领域：改判应用后 BG1AAA 1→0 分",
+          outcome["station_score"] == {"station": "BG1AAA", "before": 1,
+                                       "after": 0, "delta": -1}
+          and outcome["revision_count"] == 1
+          and len(outcome_scorecard_diff(outcome)) == 3)
+    check("复议领域：预览摘要对输入顺序不敏感",
+          preview_digest(rulings) == preview_digest(list(reversed(rulings))))
+    check("复议领域：finding_touches_station 覆盖单边证据",
+          finding_touches_station(
+              next(f for f in annotated if f["status"] == "DUP"),
+              "BG1AAA") is True
+          and finding_touches_station(
+              next(f for f in annotated if f["status"] == "DUP"),
+              "BG9ZZZ") is False)
+    st.close()
+
 print()
 if failures:
     print(f"{len(failures)} 项失败:", failures)

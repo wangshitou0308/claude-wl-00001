@@ -12,7 +12,8 @@
 ```bash
 # 启动并自动创建两个示例赛事：
 #   1) 3 份日志，覆盖全部 7 种配对状态
-#      （另冻结计分版本 1 并生成站级赛后反馈包：BG1AAA 已发布，其余为草稿）
+#      （冻结计分版本 1 并生成站级反馈包：BG1AAA 已发布，其余为草稿；
+#        另有一条针对 BG1AAA 已发布反馈包的赛后复议案件，submitted 待受理）
 #   2) 4 份日志的时钟偏差示例（快 6 分钟 / 慢 8 分钟 / 样本不足）
 python3 -m cabrillo_judge --reset-demo --demo --port 8080
 
@@ -230,6 +231,84 @@ curl -s $B/api/batches/$BID/feedback/$RID2/lineage   # 更正链追踪
   理由原文供裁判核对。
 - 生成/预览/发布不改动批次数据，批次锁定后照常可用。
 
+## 赛后复议案件
+
+台站可对**已发布**的反馈包提出异议。每个案件创建时即绑定反馈包、计分版本
+及两者的内容哈希（另算案件绑定哈希），状态维护为
+`submitted → in_review → closed`，未受理案件可由申请方 `withdrawn`。
+案件、争议项、处理意见与状态轨迹全部存于 sqlite3。
+
+```bash
+B=http://127.0.0.1:8080
+
+# 1. 提案：多项主张（subject）+ 引用 finding_id / 本台日志行
+curl -s -X POST $B/api/batches/$BID/appeals -H 'Content-Type: application/json' -d '{
+  "report_id": "'$RID'", "applicant": "BG1AAA",
+  "claims": [
+    {"subject": "pairing_status",
+     "summary": "第14行交换差异系抄收笔误，请求确认计分",
+     "finding_id": "F-061123457071",
+     "log_refs": [{"filename": "BG1AAA.log", "line": 14}]},
+    {"subject": "penalty", "summary": "第17行不构成重复，不应按 DUP 处理",
+     "finding_id": "F-dd02c285a3e6"}
+  ]}'
+# subject 取值：log_line（原日志行）/ pairing_status（配对状态）/
+#               exchange_diff（交换差异）/ penalty（罚分）/ summary_score（汇总分）
+
+# 2. 未受理可撤回；裁判受理
+curl -s -X POST $B/api/batches/$BID/appeals/$CID/withdraw \
+  -H 'Content-Type: application/json' -d '{"reason":"补充材料后重新提交"}'
+curl -s -X POST $B/api/batches/$BID/appeals/$CID/accept \
+  -H 'Content-Type: application/json' -d '{"judge":"裁判甲"}'
+
+# 3. 逐项处理预览（upheld 维持 / revised 改判 / insufficient 证据不足）
+curl -s -X POST $B/api/batches/$BID/appeals/$CID/preview \
+  -H 'Content-Type: application/json' -d '{
+    "rulings": [
+      {"claim_id":"CL-...","conclusion":"revised","resolution":"CONFIRMED",
+       "fault_station":"BG1AAA","penalty_code":"BAD_EXCHANGE",
+       "rationale":"交换差异为台站抄收笔误，通联确认计分并罚抄收错误"},
+      {"claim_id":"CL-...","conclusion":"insufficient",
+       "rationale":"未提供新证据，DUP 认定不变"}],
+    "judge":"裁判甲"}'
+# 返回：逐项 before/after、裁决变更（changed_decisions）、
+#       各台站计分变化（scorecard_diff）、新版本号与内容哈希预览、digest
+
+# 4. 确认：回传预览 digest；系统再次核对全部引用与绑定快照
+curl -s -X POST $B/api/batches/$BID/appeals/$CID/confirm \
+  -H 'Content-Type: application/json' -d '{ ...同预览的 rulings...,
+    "digest":"<preview 返回值>","note":"复议改判冻结"}'
+
+# 5. 筛选 / 详情 / 下载
+curl -s "$B/api/batches/$BID/appeals?status=closed&station=BG1AAA"
+curl -s $B/api/batches/$BID/appeals/$CID
+curl -s $B/api/batches/$BID/appeals/$CID/download -o $CID-appeal.json
+```
+
+要点：
+
+- **引用硬校验（只提示、不自动改绑）**：finding/日志行不属于该台站
+  （`CLAIM_STATION_MISMATCH`）、目标未出现在被异议反馈包
+  （`TARGET_NOT_IN_REPORT`）、证据不在绑定版本快照中
+  （`CLAIM_FINDING_NOT_FOUND`）等，逐项返回问题清单且不创建案件；
+  罚分主张的目标在报告中没有罚分记录时同样拒绝（`TARGET_NO_PENALTY`）。
+- **反馈包已有后续更正**：对已被替代的旧包提案返回 `409 REPORT_SUPERSEDED`，
+  明确提示最新更正包，系统不会自动把案件改绑到新包。
+- **预览不写入、确认有门控**：必须先预览并在确认时回传 `digest`
+  （`PREVIEW_DIGEST_MISMATCH` 拦截陈旧处理意见）。确认时在**绑定版本快照**
+  上重新核对：反馈包/版本内容哈希、报告未被替代、当前配对证据集与现行裁决
+  相对快照未漂移、逐项引用仍有效；**任一项失效返回 `409 APPEAL_STALE`
+  且整案不写入**（同一事务，裁决/证据/版本/更正包要么全部生效要么全不写）。
+- **一次性冻结**：核对通过后改判写入裁决表、重算证据并冻结**新计分版本**
+  （快照以 `created_by_appeal` 标注案件 ID）；纯维持/证据不足（无改判项）
+  的案件只记录意见并结案，不制造重复版本。
+- **原反馈包不可变**：其内容永不改写；仅当申请台站得分发生变化时，新建
+  `kind=correction`、**直接发布且对外脱敏稿就绪**的更正包，旧包只写
+  `superseded_by` 指针，沿用反馈包既有的线性替代关系；无分差不出更正包。
+- 批次数据在复议期间被改动会使确认失效（见上），裁判需重新预览或请申请方
+  针对最新包重新提案；撤回后/结案后均可就同一反馈包重新提案，未结案件
+  （submitted/in_review）期间重复提案返回 `409 APPEAL_ALREADY_EXISTS`。
+
 ## 规则配置（可配置通联分、乘数、罚分）
 
 `POST /api/batches` 的 `rules` 字段（或 `PUT .../rules`）接受完整/部分规则对象，
@@ -318,7 +397,14 @@ QSO 数、乘数、罚分、总分的 a/b 差值及新增/变更的裁决。
 | POST | `/api/batches/{id}/feedback/{rid}/publish` | 发布反馈包（不可变） |
 | GET | `/api/batches/{id}/feedback/{rid}/download` | 下载（`format=json\|txt`、`view=internal\|external`） |
 | GET | `/api/batches/{id}/feedback/{rid}/lineage` | 更正链版本追踪 |
-| GET | `/api/batches/{id}/download` | 完整 JSON 下载 |
+| POST/GET | `/api/batches/{id}/appeals` | 创建复议案件（须针对已发布反馈包，绑定版本/哈希，引用强校验）/筛选（`status/station/report_id`） |
+| GET | `/api/batches/{id}/appeals/{cid}` | 案件详情（争议项、逐项结论、状态轨迹、绑定快照与结果） |
+| POST | `/api/batches/{id}/appeals/{cid}/accept` | 裁判受理（submitted→in_review） |
+| POST | `/api/batches/{id}/appeals/{cid}/withdraw` | 申请方撤回未受理案件（→withdrawn） |
+| POST | `/api/batches/{id}/appeals/{cid}/preview` | 逐项 upheld/revised/insufficient 的裁决变更与计分预览（不写入） |
+| POST | `/api/batches/{id}/appeals/{cid}/confirm` | 二次核对全部绑定后一次性写入、冻结新版本、出更正包并结案（任一失效整案不写入） |
+| GET | `/api/batches/{id}/appeals/{cid}/download` | 下载案件 JSON |
+| GET | `/api/batches/{id}/download` | 完整 JSON 下载（含复议案件） |
 
 ## 测试
 
@@ -330,7 +416,10 @@ python3 tests/smoke_test.py
 七种配对状态、计分聚合与存储层往返、时钟偏差分析与校正方案、
 站级反馈包（冻结版本输入、逐条明细与汇总、预览-发布门控、对外脱敏——
 含自由文本中邮件地址/他台 QSO 原文清洗、更正包与更正链、
-版本-日志绑定（冻结后上传不混入）、JSON/纯文本下载、无法关联证据单列）。
+版本-日志绑定（冻结后上传不混入）、JSON/纯文本下载、无法关联证据单列）、
+赛后复议案件（创建绑定与引用强校验、撤回/受理门控、逐项结论校验、
+处理预览与 digest 门控、绑定漂移整案不写入、一次性冻结新计分版本、
+得分变化生成已发布更正包且旧包不可变、纯维持不出新版本、筛选/详情/下载）。
 
 ## 安全说明
 
