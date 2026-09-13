@@ -169,6 +169,22 @@ CREATE TABLE IF NOT EXISTS appeal_events (
     created_ts  INTEGER NOT NULL,
     UNIQUE(case_id, seq)
 );
+
+CREATE TABLE IF NOT EXISTS appeal_previews (
+    -- 服务端为案件实际生成的最新一次处理预览（单案一行）。
+    -- 确认时只认可本服务端落库的预览，客户端不得自行提交 digest 绕过。
+    case_id              TEXT PRIMARY KEY REFERENCES appeal_cases(id)
+                         ON DELETE CASCADE,
+    rulings_json         TEXT NOT NULL,
+    ruling_digest        TEXT NOT NULL,
+    binding_fingerprint  TEXT NOT NULL,
+    version_no           INTEGER NOT NULL,
+    version_content_hash TEXT NOT NULL,
+    report_content_hash  TEXT NOT NULL,
+    score_before         INTEGER NOT NULL,
+    score_after          INTEGER NOT NULL,
+    created_ts           INTEGER NOT NULL
+);
 """
 
 
@@ -639,12 +655,32 @@ class Storage:
 
     def latest_published_feedback(self, batch_id: str,
                                   station: str) -> dict[str, Any] | None:
+        # 同秒连续发布多个包时 published_ts/created_ts 都可能并列；
+        # 用版本号与 id 做确定性决胜，保证始终选中更正链最末端的已发布包
         row = self.conn.execute(
             "SELECT * FROM feedback_reports WHERE batch_id = ? AND "
             "station_call = ? AND status = 'published' "
-            "ORDER BY published_ts DESC, created_ts DESC LIMIT 1",
+            "ORDER BY version_no DESC, published_ts DESC, created_ts DESC, "
+            "id DESC LIMIT 1",
             (batch_id, station)).fetchone()
         return self._feedback_row(row) if row else None
+
+    def published_feedback_for_version(self, batch_id: str, station: str,
+                                       version_no: int
+                                       ) -> dict[str, Any] | None:
+        """该台站在指定冻结版本上已发布的反馈包（含更正包）。
+
+        同一冻结版本上的已发布包内容哈希固定，重复生成时必须幂等复用，
+        不得因 latest_published 在同秒并列时选错链头而另建 normal 草稿。
+        优先取更新链最末端（superseded_by 为空）者。
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM feedback_reports WHERE batch_id = ? AND "
+            "station_call = ? AND version_no = ? AND status = 'published' "
+            "ORDER BY (superseded_by IS NULL) DESC, published_ts DESC, "
+            "created_ts DESC, id DESC",
+            (batch_id, station, int(version_no))).fetchall()
+        return self._feedback_row(rows[0]) if rows else None
 
     def set_feedback_external(self, report_id: str,
                               external: dict[str, Any]) -> None:
@@ -801,6 +837,82 @@ class Storage:
         with self._lock:
             with self.conn:
                 self._append_event_unlocked(case_id, event_type, actor, detail)
+
+    # -- 赛后复议：服务端处理预览（确认门控依据） ---------------------------
+    def save_appeal_preview(self, case_id: str, rulings: list[dict[str, Any]],
+                            ruling_digest: str, binding_fingerprint: str,
+                            *, version_no: int, version_content_hash: str,
+                            report_content_hash: str,
+                            score_before: int, score_after: int) -> None:
+        """记录服务端为该案件实际生成的最新一次处理预览（覆盖旧预览）。"""
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT INTO appeal_previews (case_id, rulings_json, "
+                    "ruling_digest, binding_fingerprint, version_no, "
+                    "version_content_hash, report_content_hash, "
+                    "score_before, score_after, created_ts) VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(case_id) DO UPDATE SET "
+                    "rulings_json=excluded.rulings_json, "
+                    "ruling_digest=excluded.ruling_digest, "
+                    "binding_fingerprint=excluded.binding_fingerprint, "
+                    "version_no=excluded.version_no, "
+                    "version_content_hash=excluded.version_content_hash, "
+                    "report_content_hash=excluded.report_content_hash, "
+                    "score_before=excluded.score_before, "
+                    "score_after=excluded.score_after, "
+                    "created_ts=excluded.created_ts",
+                    (case_id, json.dumps(rulings, ensure_ascii=False),
+                     ruling_digest, binding_fingerprint, int(version_no),
+                     version_content_hash, report_content_hash,
+                     int(score_before), int(score_after), _now()))
+
+    def get_appeal_preview(self, case_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM appeal_previews WHERE case_id = ?",
+            (case_id,)).fetchone()
+        if not row:
+            return None
+        return {"case_id": row["case_id"],
+                "rulings": json.loads(row["rulings_json"]),
+                "ruling_digest": row["ruling_digest"],
+                "binding_fingerprint": row["binding_fingerprint"],
+                "version_no": row["version_no"],
+                "version_content_hash": row["version_content_hash"],
+                "report_content_hash": row["report_content_hash"],
+                "score_before": row["score_before"],
+                "score_after": row["score_after"],
+                "created_ts": row["created_ts"]}
+
+    def delete_appeal_preview(self, case_id: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                "DELETE FROM appeal_previews WHERE case_id = ?", (case_id,))
+            self.conn.commit()
+
+    def live_binding_fingerprint(self, batch_id: str,
+                                 bound_finding_ids: set[str]) -> str:
+        """当前配对证据集与现行裁决（限绑定证据）的绑定指纹。
+
+        证据集必须恰好等于绑定快照；任一证据缺失/新增，或某条现行裁决
+        与创建预览时不同，确认时据此判定预览失效。
+        """
+        rows = self.conn.execute(
+            "SELECT finding_id, data_json FROM findings WHERE batch_id = ?",
+            (batch_id,)).fetchall()
+        live_ids = {r["finding_id"] for r in rows}
+        decisions = self.list_decisions(batch_id)
+        from .appeals import binding_fingerprint
+        if live_ids != set(bound_finding_ids):
+            # 证据集已变：给出与任何快照都不同的指纹
+            missing = sorted(set(bound_finding_ids) - live_ids)
+            added = sorted(live_ids - set(bound_finding_ids))
+            return binding_fingerprint(
+                [f"__missing__:{x}" for x in missing]
+                + [f"__added__:{x}" for x in added]
+                + sorted(live_ids), decisions)
+        return binding_fingerprint(sorted(live_ids), decisions)
 
     def set_appeal_status(self, case_id: str, status: str,
                           *, judge: str | None = None,
@@ -980,6 +1092,46 @@ class Storage:
                                       f"{ref.get('line')} 未出现在反馈包中",
                                       problems)
 
+                # 服务端处理预览门控：只认可本服务端为该案件实际生成、
+                # 与最新绑定快照和当前处理意见一致的预览；客户端不得自行
+                # 提交 digest 绕过预览步骤
+                preview = self.get_appeal_preview(case_id)
+                if preview is None:
+                    stale("PREVIEW_REQUIRED",
+                          f"案件 {case_id} 没有服务端生成的处理预览；"
+                          f"请先 POST .../preview 生成并核对后再确认",
+                          problems)
+                else:
+                    from .appeals import preview_digest
+                    if preview["ruling_digest"] != preview_digest(rulings):
+                        stale("PREVIEW_MISMATCH",
+                              "确认提交的处理意见与最近一次服务端预览不"
+                              "一致；请重新生成预览并核对后再确认", problems)
+                    if preview["version_no"] != case["version_no"] or \
+                            preview["version_content_hash"] != \
+                            case["version_content_hash"] or \
+                            preview["report_content_hash"] != \
+                            case["report_content_hash"]:
+                        stale("PREVIEW_STALE",
+                              "生成预览所依据的版本/反馈包绑定已变化，"
+                              "预览失效；请重新预览", problems)
+                    current_fingerprint = self.live_binding_fingerprint(
+                        case["batch_id"], bound_ids)
+                    if preview["binding_fingerprint"] != current_fingerprint:
+                        stale("PREVIEW_STALE",
+                              "生成预览后配对证据集或现行裁决已变化，"
+                              "预览失效（不会按陈旧预览写入）；"
+                              "请重新预览", problems)
+                    if version is not None:
+                        snapshot_fingerprint = \
+                            _appeals.binding_fingerprint(
+                                sorted(bound_ids), bound_decisions)
+                        if preview["binding_fingerprint"] != \
+                                snapshot_fingerprint:
+                            stale("PREVIEW_STALE",
+                                  "预览生成时的绑定依据与案件绑定快照不"
+                                  "一致；请重新预览", problems)
+
                 if problems:
                     raise AppealStale(problems)
 
@@ -1141,6 +1293,10 @@ class Storage:
                         case_id, "version_frozen", judge,
                         {"version_no": new_no, "content_hash": digest})
                 self._append_event_unlocked(case_id, "closed", judge, {})
+                # 处理意见一次性消费：确认成功后删除预览，防止重放
+                self.conn.execute(
+                    "DELETE FROM appeal_previews WHERE case_id = ?",
+                    (case_id,))
                 return {"version_no": new_no, "content_hash": digest,
                         "frozen": new_no is not None,
                         "correction_report_id": correction_id,

@@ -68,6 +68,28 @@ def _canonical(obj: Any) -> bytes:
                       separators=(",", ":")).encode("utf-8")
 
 
+# 绑定指纹只取影响裁决依据的字段（不含 updated_ts 等元数据）
+_FINGERPRINT_DECISION_KEYS = ("resolution", "fault_station",
+                              "penalty_code", "reason", "judge")
+
+
+def binding_fingerprint(finding_ids: list[str],
+                        decisions: dict[str, dict[str, Any]]) -> str:
+    """当前配对证据集与现行裁决的指纹；预览生成与确认时必须一致。
+
+    证据集合变化（增删/状态改变导致 finding id 变化）或任一条现行裁决
+    变化都会改变指纹——此时服务端此前生成的预览即告失效。
+    """
+    payload = {
+        "findings": sorted(finding_ids),
+        "decisions": {
+            fid: {k: (decisions.get(fid) or {}).get(k)
+                  for k in _FINGERPRINT_DECISION_KEYS}
+            for fid in sorted(finding_ids)},
+    }
+    return hashlib.sha256(_canonical(payload)).hexdigest()
+
+
 def case_content_hash(*, report_id: str, station: str, version_no: int,
                       version_content_hash: str, report_content_hash: str,
                       claims: list[dict[str, Any]]) -> str:

@@ -230,6 +230,10 @@ curl -s $B/api/batches/$BID/feedback/$RID2/lineage   # 更正链追踪
   预览、发布、下载全程生效。内部稿（`view=internal`）保留双方原始行与
   理由原文供裁判核对。
 - 生成/预览/发布不改动批次数据，批次锁定后照常可用。
+- **重复生成幂等**：对同一冻结版本重复生成反馈包时，只要该台站在该版本上
+  已有已发布包（普通包或更正包），始终返回同一个包（`identical_to`，
+  `reused=published_same_version`），不会因同秒发布的并列排序而偶发新建
+  `kind=normal` 的草稿；内容哈希相同的草稿同样幂等复用。
 
 ## 赛后复议案件
 
@@ -272,12 +276,15 @@ curl -s -X POST $B/api/batches/$BID/appeals/$CID/preview \
        "rationale":"未提供新证据，DUP 认定不变"}],
     "judge":"裁判甲"}'
 # 返回：逐项 before/after、裁决变更（changed_decisions）、
-#       各台站计分变化（scorecard_diff）、新版本号与内容哈希预览、digest
+#       各台站计分变化（scorecard_diff）、新版本号与内容哈希预览、digest、
+#       binding_current（false 表示绑定已漂移、该预览不能用于确认）；
+#       预览由服务端落库为当前唯一有效的确认依据
 
-# 4. 确认：回传预览 digest；系统再次核对全部引用与绑定快照
+# 4. 确认：rulings 必须与最近一次服务端预览一致（digest 可省略，
+#    自行伪造 digest 无法绕过预览）；服务端再核对绑定未漂移
 curl -s -X POST $B/api/batches/$BID/appeals/$CID/confirm \
   -H 'Content-Type: application/json' -d '{ ...同预览的 rulings...,
-    "digest":"<preview 返回值>","note":"复议改判冻结"}'
+    "note":"复议改判冻结"}'
 
 # 5. 筛选 / 详情 / 下载
 curl -s "$B/api/batches/$BID/appeals?status=closed&station=BG1AAA"
@@ -287,6 +294,15 @@ curl -s $B/api/batches/$BID/appeals/$CID/download -o $CID-appeal.json
 
 要点：
 
+- **预览由服务端落库、确认无法绕过**：`preview` 生成的预览由服务端持久化为
+  该案件当前唯一有效的确认依据（绑定证据集/现行裁决指纹）。确认时只认可
+  服务端实际生成、且与最新绑定快照和处理意见一致的预览：从未预览
+  （`PREVIEW_REQUIRED`）、处理意见与预览不一致（`PREVIEW_MISMATCH`）、
+  或预览后配对证据集/现行裁决发生变化（`PREVIEW_STALE`）一律返回
+  `409 APPEAL_STALE` 且整案不写入——客户端自行计算 `digest` 无法跳过预览；
+  请求体中的 `digest` 仅作可选核对。预览不改动批次数据，但响应中的
+  `binding_current=false` 表示生成时绑定已漂移、该预览不能用于确认。
+  确认成功后预览立即被消费删除，处理意见不可重放。
 - **引用硬校验（只提示、不自动改绑）**：finding/日志行不属于该台站
   （`CLAIM_STATION_MISMATCH`）、目标未出现在被异议反馈包
   （`TARGET_NOT_IN_REPORT`）、证据不在绑定版本快照中
@@ -294,11 +310,10 @@ curl -s $B/api/batches/$BID/appeals/$CID/download -o $CID-appeal.json
   罚分主张的目标在报告中没有罚分记录时同样拒绝（`TARGET_NO_PENALTY`）。
 - **反馈包已有后续更正**：对已被替代的旧包提案返回 `409 REPORT_SUPERSEDED`，
   明确提示最新更正包，系统不会自动把案件改绑到新包。
-- **预览不写入、确认有门控**：必须先预览并在确认时回传 `digest`
-  （`PREVIEW_DIGEST_MISMATCH` 拦截陈旧处理意见）。确认时在**绑定版本快照**
-  上重新核对：反馈包/版本内容哈希、报告未被替代、当前配对证据集与现行裁决
-  相对快照未漂移、逐项引用仍有效；**任一项失效返回 `409 APPEAL_STALE`
-  且整案不写入**（同一事务，裁决/证据/版本/更正包要么全部生效要么全不写）。
+- **确认时的绑定复核**：确认在**绑定版本快照**上重新核对反馈包/版本内容
+  哈希、报告未被替代、当前配对证据集与现行裁决相对快照未漂移、逐项引用仍
+  有效；**任一项失效返回 `409 APPEAL_STALE` 且整案不写入**（同一事务，
+  裁决/证据/版本/更正包要么全部生效要么全不写）。
 - **一次性冻结**：核对通过后改判写入裁决表、重算证据并冻结**新计分版本**
   （快照以 `created_by_appeal` 标注案件 ID）；纯维持/证据不足（无改判项）
   的案件只记录意见并结案，不制造重复版本。
@@ -418,8 +433,10 @@ python3 tests/smoke_test.py
 含自由文本中邮件地址/他台 QSO 原文清洗、更正包与更正链、
 版本-日志绑定（冻结后上传不混入）、JSON/纯文本下载、无法关联证据单列）、
 赛后复议案件（创建绑定与引用强校验、撤回/受理门控、逐项结论校验、
-处理预览与 digest 门控、绑定漂移整案不写入、一次性冻结新计分版本、
-得分变化生成已发布更正包且旧包不可变、纯维持不出新版本、筛选/详情/下载）。
+服务端落库预览与确认门控——自算 digest 不能绕过、未预览/预览漂移整案不写入、
+预览一次性消费不可重放、绑定漂移整案不写入、一次性冻结新计分版本、
+得分变化生成已发布更正包且旧包不可变、纯维持不出新版本、同版本重复生成
+始终幂等复用已发布包、筛选/详情/下载）。
 
 ## 安全说明
 

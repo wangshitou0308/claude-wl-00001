@@ -26,6 +26,7 @@ from .appeals import (
     CONCLUSION_LABELS,
     SUBJECT_LABELS,
     apply_rulings,
+    binding_fingerprint,
     case_content_hash,
     outcome_scorecard_diff,
     preview_digest,
@@ -183,14 +184,20 @@ API_SPEC: dict[str, Any] = {
         {"method": "POST", "path": "/api/batches/{id}/appeals/{cid}/withdraw",
          "desc": "申请方撤回未受理案件（submitted → withdrawn）。JSON: {reason?}"},
         {"method": "POST", "path": "/api/batches/{id}/appeals/{cid}/preview",
-         "desc": "处理预览：逐项给出 upheld|revised|insufficient 结论"
+         "desc": "处理预览（由服务端落库为该案件当前唯一有效的确认依据）："
+                 "逐项给出 upheld|revised|insufficient 结论"
                  "（revised 须带 resolution/reason，可带 fault_station/"
-                 "penalty_code/judge）；返回裁决变更与计分预览，不写入"},
+                 "penalty_code/judge）；返回裁决变更与计分预览，不改动批次"
+                 "数据。binding_current=false 表示生成时绑定已漂移、该预览"
+                 "不可用于确认"},
         {"method": "POST", "path": "/api/batches/{id}/appeals/{cid}/confirm",
-         "desc": "确认处理：再次核对全部引用与绑定哈希，任一项失效整案不"
-                 "写入；通过后一次性写入改判、冻结新计分版本，得分变化时"
-                 "生成沿用既有替代关系的更正包并结案。JSON 与预览一致，"
-                 "另可带 digest（预览返回值）、note、judge"},
+         "desc": "确认处理：只接受服务端为该案件实际生成、且与最新绑定"
+                 "快照和处理意见一致的预览（请求体 digest 可选，仅作核对）；"
+                 "无预览（PREVIEW_REQUIRED）、处理意见不一致"
+                 "（PREVIEW_MISMATCH）或预览后证据集/裁决已变化"
+                 "（PREVIEW_STALE，409 APPEAL_STALE）时均不写入。"
+                 "通过后一次性写入改判、冻结新计分版本，得分变化时生成沿用"
+                 "既有替代关系的更正包并结案、消费删除预览"},
         {"method": "GET", "path": "/api/batches/{id}/appeals/{cid}/download",
          "desc": "下载案件 JSON（含绑定快照、争议项、结论、轨迹、"
                  "裁决变更、计分预览/结果、更正包信息）"},
@@ -276,9 +283,12 @@ API_SPEC: dict[str, Any] = {
             "冻结新计分版本；得分变化时生成沿用替代关系的更正包并结案",
             "未受理案件可由申请方 POST .../appeals/{cid}/withdraw 撤回",
         ],
-        "atomicity": "确认时再次核对反馈包/版本内容哈希、报告未被替代、"
-                     "配对证据集与现行裁决未漂移、逐项引用仍有效；"
-                     "任一项失效返回 409 APPEAL_STALE 且整案不写入",
+        "atomicity": "确认以服务端落库的处理预览为唯一依据：无预览"
+                     "（PREVIEW_REQUIRED）、处理意见与预览不一致"
+                     "（PREVIEW_MISMATCH）或预览后反馈包/版本哈希、配对证据集、"
+                     "现行裁决发生变化（PREVIEW_STALE）均返回 409 "
+                     "APPEAL_STALE 且整案不写入；确认成功后预览即被消费删除，"
+                     "不可重放",
         "immutability": "原反馈包内容永不改写；得分变化时新建 kind=correction "
                         "的已发布更正包，旧包只写 superseded_by 指针，"
                         "沿用反馈包既有的线性替代关系",
@@ -1500,6 +1510,17 @@ class JudgeHandler(BaseHTTPRequestHandler):
                     raise ApiError(HTTPStatus.NOT_FOUND, "NO_STATION_LOG",
                                    f"台站 {st} 在本批次没有提交日志")
                 continue
+            # 幂等优先：同一冻结版本上该台站已有已发布包（普通包或更正包）
+            # 时直接复用，绝不另建 normal 草稿——这保证重复生成始终返回
+            # 同一个已发布包，不受同秒发布时 latest_pub 排序影响
+            same_version_pub = None if corrects_id else \
+                self.storage.published_feedback_for_version(
+                    bid, st, version_no)
+            if same_version_pub is not None:
+                out.append({"report": _slim_feedback(same_version_pub),
+                            "identical_to": same_version_pub["id"],
+                            "reused": "published_same_version"})
+                continue
             latest_pub = self.storage.latest_published_feedback(bid, st)
             kind, corrects = "normal", None
             if corrects_id:
@@ -1982,6 +2003,23 @@ class JudgeHandler(BaseHTTPRequestHandler):
             snapshot["rules"], outcome["annotated_findings"],
             outcome["decisions"], outcome["results_after"],
             clock_scheme=self._scheme_slim(ver))
+        bound_ids = {f["id"] for f in (snapshot.get("findings") or [])}
+        fingerprint = self.storage.live_binding_fingerprint(bid, bound_ids)
+        binding_current = fingerprint == binding_fingerprint(
+            sorted(bound_ids), snapshot.get("decisions") or {})
+        # 预览由服务端落库，确认时只认可这里生成的记录（客户端无法伪造）
+        self.storage.save_appeal_preview(
+            cid, rulings, digest, fingerprint,
+            version_no=case["version_no"],
+            version_content_hash=case["version_content_hash"],
+            report_content_hash=case["report_content_hash"],
+            score_before=outcome["station_score"]["before"],
+            score_after=outcome["station_score"]["after"])
+        self.storage.add_appeal_event(
+            cid, "previewed", body.get("judge"),
+            {"revision_count": outcome["revision_count"],
+             "score_after": outcome["station_score"]["after"],
+             "binding_current": binding_current})
         self._send_json({
             "case_id": cid, "digest": digest,
             "judge": body.get("judge"),
@@ -1993,8 +2031,14 @@ class JudgeHandler(BaseHTTPRequestHandler):
             "prospective_version_no": self.storage.next_version_no(bid),
             "prospective_content_hash": prospective_hash,
             "correction_required": outcome["score_changed"],
-            "note": "预览不写入任何数据；确认（POST .../confirm）时将再次核对"
-                    "全部引用与绑定哈希，任一项失效则整案不写入"})
+            "binding_current": binding_current,
+            "note": ("预览不写入批次数据，但已由服务端记录为本次案件的确认"
+                     "依据；确认（POST .../confirm）时服务端会核对本预览、"
+                     "最新绑定快照与处理意见三者一致，任一项失效则整案不写入")
+            if binding_current else
+            ("警告：生成预览时批次配对证据/现行裁决已与案件绑定快照不一致，"
+             "当前预览无法直接确认；请核对批次变更后重新预览，或针对最新"
+             "反馈包重新提案")})
 
     def _confirm_appeal(self, bid: str, cid: str) -> None:
         batch = self._get_batch_or_404(bid)
@@ -2005,21 +2049,39 @@ class JudgeHandler(BaseHTTPRequestHandler):
                 f"案件当前为 {case['status']}；仅 in_review 案件可确认处理")
         ver = self._bound_version(case)
         rulings, body = self._load_rulings(case, ver)
-        digest = body.get("digest")
-        if not digest:
+        # 确认门控以服务端落库的预览为准；请求体里的 digest 仅作提示，
+        # 不能用于绕过预览。无预览/预览失效统一在存储事务内核对并返回
+        # 409 APPEAL_STALE（details 逐项说明），这里只快速核对处理意见
+        # 与预览的一致性
+        stored_preview = self.storage.get_appeal_preview(cid)
+        if stored_preview is not None and \
+                stored_preview["ruling_digest"] != preview_digest(rulings):
             raise ApiError(
-                HTTPStatus.BAD_REQUEST, "PREVIEW_REQUIRED",
-                "确认前须先 POST .../preview 取得处理预览，并在确认时回传 "
-                "digest，防止凭陈旧处理意见写入")
-        if digest != preview_digest(rulings):
-            raise ApiError(
-                HTTPStatus.CONFLICT, "PREVIEW_DIGEST_MISMATCH",
-                "确认内容与最近一次预览不一致；请重新生成预览并核对后再确认")
+                HTTPStatus.CONFLICT, "PREVIEW_MISMATCH",
+                "确认提交的处理意见与最近一次服务端预览不一致；"
+                "请重新生成预览并核对后再确认")
+        if stored_preview is not None:
+            client_digest = body.get("digest")
+            if client_digest is not None and \
+                    client_digest != stored_preview["ruling_digest"]:
+                raise ApiError(
+                    HTTPStatus.CONFLICT, "PREVIEW_DIGEST_MISMATCH",
+                    "请求体 digest 与服务端预览不一致；请以最新预览返回的 "
+                    "digest 为准，或省略该字段")
         snapshot = ver["snapshot"]
         outcome = apply_rulings(
             rules=snapshot["rules"], station=case["station"],
             claims=self.storage.list_appeal_claims(case["id"]),
             rulings=rulings, snapshot=snapshot)
+        if stored_preview is not None and \
+                (outcome["station_score"]["before"],
+                 outcome["station_score"]["after"]) != \
+                (stored_preview["score_before"],
+                 stored_preview["score_after"]):
+            raise ApiError(
+                HTTPStatus.CONFLICT, "PREVIEW_STALE",
+                "重新计算的计分与服务端预览不一致（绑定依据可能已变化）；"
+                "请重新预览后再确认")
         judge = str(body.get("judge") or case.get("judge") or ""
                     ).strip() or None
         note = str(body.get("note") or "").strip() or (
@@ -2248,11 +2310,14 @@ th{{background:#f7f7f7}}</style></head><body>
 <li><code>POST …/appeals/{{cid}}/accept</code> 裁判受理（in_review）</li>
 <li><code>POST …/appeals/{{cid}}/preview</code> 逐项给出
 <code>upheld</code>（维持）/<code>revised</code>（改判）/
-<code>insufficient</code>（证据不足），先看裁决变更与计分预览（不写入）</li>
-<li><code>POST …/appeals/{{cid}}/confirm</code> 回传预览 <code>digest</code> 确认；
-系统再次核对全部引用与绑定快照，<strong>任一项失效则整案不写入</strong>，
-通过后一次性写入改判、冻结新计分版本；得分变化时生成沿用既有替代关系的
-已发布更正包并结案。原反馈包永不改写</li>
+<code>insufficient</code>（证据不足），先看裁决变更与计分预览（不写入批次数据）；
+预览由<strong>服务端落库</strong>，返回 <code>binding_current</code></li>
+<li><code>POST …/appeals/{{cid}}/confirm</code> 确认：只认可服务端实际生成、
+与最新绑定快照和处理意见一致的预览；从未预览（即使请求体自带自算
+<code>digest</code>）、意见不一致或预览后证据集/裁决已变化时一律
+<strong>409 APPEAL_STALE 整案不写入</strong>；通过后一次性写入改判、
+冻结新计分版本，得分变化时生成沿用既有替代关系的已发布更正包并结案、
+消费删除预览（不可重放）。原反馈包永不改写</li>
 <li><code>GET …/appeals?status=&amp;station=&amp;report_id=</code> 筛选；
 <code>GET …/appeals/{{cid}}</code> 详情（争议项/意见/状态轨迹）；
 <code>GET …/appeals/{{cid}}/download</code> 下载案件 JSON</li>

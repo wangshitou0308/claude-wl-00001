@@ -1170,62 +1170,35 @@ with tempfile.TemporaryDirectory() as d:
     check("复议：预览不写入（版本仍为 1、案件仍 in_review）",
           len(api3("GET", f"/api/batches/{abid}/versions")[1]["versions"]) == 1)
 
-    # 无 digest / digest 不符拒绝确认
+    # 不带 digest 也可确认：门控以服务端落库预览为准（客户端 digest
+    # 只是可选核对项，无法用来跳过或伪造预览）
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid2}/confirm",
+                      {"rulings": rulings, "judge": "裁判甲",
+                       "note": "复议改判冻结"})
+    check("复议：无客户端 digest 仍以服务端预览确认成功",
+          st_code == 200 and r["case"]["status"] == "closed"
+          and r["frozen_version"]["version_no"] == 2, str(r)[:200])
+    # 预览已被消费：同内容再次确认失败（不可重放）
     st_code, r = api3("POST",
                       f"/api/batches/{abid}/appeals/{cid2}/confirm",
                       {"rulings": rulings})
-    check("复议：无预览 digest 不能确认", st_code == 400
-          and r["error"] == "PREVIEW_REQUIRED", str(r)[:120])
-    st_code, r = api3("POST",
-                      f"/api/batches/{abid}/appeals/{cid2}/confirm",
-                      {"rulings": rulings, "digest": "0" * 64})
-    check("复议：digest 不符拒绝确认", st_code == 409
-          and r["error"] == "PREVIEW_DIGEST_MISMATCH", str(r)[:120])
-
-    # 绑定漂移：确认前改动另一条证据裁决 -> 整案不写入
-    st_code, r = api3("GET",
-                      f"/api/batches/{abid}/findings?status=NO_PARTNER_LOG")
-    fid_npl = r["findings"][0]["id"]
-    api3("POST", f"/api/batches/{abid}/findings/{fid_npl}/decision",
-         {"resolution": "GRANTED",
-          "reason": "赛后另行改判，使绑定快照漂移"})
-    st_code, r = api3("POST",
-                      f"/api/batches/{abid}/appeals/{cid2}/confirm",
-                      {"rulings": rulings, "digest": digest})
-    check("复议：绑定失效时整案不写入（APPEAL_STALE）",
-          st_code == 409 and r["error"] == "APPEAL_STALE"
-          and any(p["code"] == "DECISION_STALE" for p in r["details"])
-          and any("整案不写入" in p["message"] for p in r["details"]),
-          json.dumps(r, ensure_ascii=False)[:300])
-    st_code, r = api3("GET", f"/api/batches/{abid}/appeals/{cid2}")
-    check("复议：失败后案件仍 in_review、版本未增加",
-          r["case"]["status"] == "in_review"
-          and len(api3("GET", f"/api/batches/{abid}/versions")[1]
-                  ["versions"]) == 1)
-
-    # 撤销那条漂移裁决后确认成功（一次性写入并冻结 v2）
-    api3("DELETE", f"/api/batches/{abid}/findings/{fid_npl}/decision")
-    st_code, r = api3("POST",
-                      f"/api/batches/{abid}/appeals/{cid2}/confirm",
-                      {"rulings": rulings, "digest": digest,
-                       "judge": "裁判甲", "note": "复议改判冻结"})
-    check("复议：确认成功并结案",
-          st_code == 200 and r["case"]["status"] == "closed"
-          and r["frozen"] is True
-          and r["frozen_version"]["version_no"] == 2
-          and r["case"]["resolved_version_no"] == 2
-          and r["case"]["score_before"] == 1
-          and r["case"]["score_after"] == 0, str(r)[:300])
-    corr_id = r["correction_published"]
-    check("复议：得分变化生成更正包", bool(corr_id))
+    check("复议：确认后预览被消费、不可重放",
+          st_code == 409 and r["error"] == "APPEAL_NOT_IN_REVIEW",
+          str(r)[:120])
+    corr_id = r_corr = None
+    # 取结案响应中的更正包供后续断言
+    st_code, closed = api3("GET", f"/api/batches/{abid}/appeals/{cid2}")
+    corr_id = closed["outcome"]["correction_report"]["id"]
     check("复议：逐项结论落库",
-          [(c["seq"], c["conclusion"], c["resolution"]) for c in r["claims"]]
-          == [(1, "revised", "CONFIRMED")])
-    check("复议：状态轨迹完整",
-          [e["event_type"] for e in r["events"]]
-          == ["created", "accepted", "correction_published", "ruled",
-              "version_frozen", "closed"],
-          str([e["event_type"] for e in r["events"]]))
+          [(c["seq"], c["conclusion"], c["resolution"])
+           for c in closed["claims"]] == [(1, "revised", "CONFIRMED")])
+    check("复议：得分变化生成更正包", bool(corr_id))
+    check("复议：状态轨迹完整（含预览事件）",
+          [e["event_type"] for e in closed["events"]]
+          == ["created", "accepted", "previewed", "correction_published",
+              "ruled", "version_frozen", "closed"],
+          str([e["event_type"] for e in closed["events"]]))
 
     # 新裁决实际进入批次：v2 结果与现行 results 一致
     st_code, r = api3("GET", f"/api/batches/{abid}/results")
@@ -1281,7 +1254,7 @@ with tempfile.TemporaryDirectory() as d:
           and r["schema_version"] == 1
           and r["case"]["id"] == cid2
           and r["outcome"]["correction_report"]["id"] == corr_id
-          and len(r["claims"]) == 1 and len(r["events"]) == 6,
+          and len(r["claims"]) == 1 and len(r["events"]) == 7,
           str(list(r.keys())))
 
     # 筛选：station/report_id
@@ -1331,6 +1304,114 @@ with tempfile.TemporaryDirectory() as d:
     check("复议：版本数仍为 2",
           len(api3("GET", f"/api/batches/{abid}/versions")[1]
               ["versions"]) == 2)
+
+    # --- 门控回归 1：从未调用预览，客户端自行提交 digest 必须被拒 --------
+    st_code, r = api3("POST", f"/api/batches/{abid}/appeals", {
+        "report_id": rid_b, "claims": [
+            {"subject": "summary_score", "summary": "申请改判计分"}]})
+    cid4 = r["case"]["id"]
+    api3("POST", f"/api/batches/{abid}/appeals/{cid4}/accept",
+         {"judge": "丙"})
+    st_code, dcase = api3("GET", f"/api/batches/{abid}/appeals/{cid4}")
+    cl4 = dcase["claims"][0]["id"]
+    forged = preview_digest([{"claim_id": cl4, "conclusion": "upheld",
+                              "rationale": "客户端自行构造的意见"}])
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid4}/confirm",
+                      {"rulings": [{"claim_id": cl4,
+                                    "conclusion": "upheld",
+                                    "rationale": "客户端自行构造的意见"}],
+                       "digest": forged})
+    check("复议：从未预览时自算 digest 不能确认（PREVIEW_REQUIRED）",
+          st_code == 409 and r["error"] == "APPEAL_STALE"
+          and any(p["code"] == "PREVIEW_REQUIRED" for p in r["details"])
+          and any("服务端" in p["message"] for p in r["details"]),
+          json.dumps(r, ensure_ascii=False)[:300])
+    st_code, dcase = api3("GET", f"/api/batches/{abid}/appeals/{cid4}")
+    check("复议：绕过尝试不改变案件/版本",
+          dcase["case"]["status"] == "in_review"
+          and len(api3("GET", f"/api/batches/{abid}/versions")[1]
+                  ["versions"]) == 2)
+
+    # --- 门控回归 2：预览后绑定漂移，旧预览失效，重预览后才可确认 ---------
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid4}/preview",
+                      {"rulings": [{"claim_id": cl4,
+                                    "conclusion": "upheld",
+                                    "rationale": "复核后维持"}]})
+    check("复议：预览时绑定仍最新（binding_current=true）",
+          r["binding_current"] is True, str(r)[:120])
+    fid_npl = api3("GET",
+                   f"/api/batches/{abid}/findings?status=NO_PARTNER_LOG"
+                   )[1]["findings"][0]["id"]
+    api3("POST", f"/api/batches/{abid}/findings/{fid_npl}/decision",
+         {"resolution": "GRANTED", "reason": "预览后另行改判造成漂移"})
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid4}/confirm",
+                      {"rulings": [{"claim_id": cl4,
+                                    "conclusion": "upheld",
+                                    "rationale": "复核后维持"}]})
+    check("复议：预览后漂移则确认拒绝（PREVIEW_STALE，整案不写入）",
+          st_code == 409 and r["error"] == "APPEAL_STALE"
+          and any(p["code"] in ("PREVIEW_STALE", "DECISION_STALE")
+                  for p in r["details"]),
+          json.dumps(r, ensure_ascii=False)[:300])
+    st_code, dcase = api3("GET", f"/api/batches/{abid}/appeals/{cid4}")
+    check("复议：漂移后案件仍 in_review、版本未增加",
+          dcase["case"]["status"] == "in_review"
+          and len(api3("GET", f"/api/batches/{abid}/versions")[1]
+                  ["versions"]) == 2)
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid4}/preview",
+                      {"rulings": [{"claim_id": cl4,
+                                    "conclusion": "upheld",
+                                    "rationale": "漂移后重新预览"}]})
+    check("复议：绑定漂移时预览标注 binding_current=false",
+          st_code == 200 and r["binding_current"] is False)
+    api3("DELETE", f"/api/batches/{abid}/findings/{fid_npl}/decision")
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid4}/preview",
+                      {"rulings": [{"claim_id": cl4,
+                                    "conclusion": "upheld",
+                                    "rationale": "恢复后重新预览"}]})
+    check("复议：恢复后重新预览 binding_current=true",
+          r["binding_current"] is True)
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid4}/confirm",
+                      {"rulings": [{"claim_id": cl4,
+                                    "conclusion": "upheld",
+                                    "rationale": "恢复后重新预览"}]})
+    check("复议：重新预览后纯维持结案、不新增版本",
+          st_code == 200 and r["case"]["status"] == "closed"
+          and r["frozen"] is False, str(r)[:200])
+    st_code, r = api3("POST",
+                      f"/api/batches/{abid}/appeals/{cid4}/confirm",
+                      {"rulings": [{"claim_id": cl4,
+                                    "conclusion": "upheld",
+                                    "rationale": "重放"}]})
+    check("复议：结案后确认被拒（处理意见不可重放）", st_code == 409)
+
+    # --- 幂等回归：同一冻结版本重复生成始终复用已发布包，不多留草稿 -------
+    idem_ids = []
+    for _ in range(5):
+        st_code, rr = api3("POST", f"/api/batches/{abid}/feedback",
+                           {"version_no": 2, "station": "BG1AAA"})
+        idem_ids.append(rr["reports"][0]["report"]["id"])
+        check("复议：v2 更正包重复生成幂等复用（无 normal 草稿）",
+              st_code == 200
+              and rr["reports"][0].get("identical_to") == corr_id
+              and rr["reports"][0]["report"]["status"] == "published"
+              and rr["reports"][0]["report"]["kind"] == "correction",
+              json.dumps(rr["reports"][0], ensure_ascii=False)[:200])
+    check("复议：五次重复生成返回同一已发布包",
+          len(set(idem_ids)) == 1 and idem_ids[0] == corr_id, str(idem_ids))
+    st_code, lst = api3(
+        "GET",
+        f"/api/batches/{abid}/feedback?station=BG1AAA&version_no=2")
+    check("复议：v2 上 BG1AAA 只有一个已发布更正包、无多余草稿",
+          lst["count"] == 1 and lst["reports"][0]["id"] == corr_id
+          and lst["reports"][0]["status"] == "published",
+          json.dumps(lst["reports"], ensure_ascii=False)[:300])
 
     server.shutdown()
     server.server_close()
