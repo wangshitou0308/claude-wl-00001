@@ -90,6 +90,14 @@ CREATE TABLE IF NOT EXISTS decision_archive (
     archived_ts    INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS band_analysis (
+    -- 当前生效规则+日志+校正方案下的频段切换合规分析（每批次一行快照）；
+    -- 每次重跑配对时与 findings 在同一事务内替换。历史分析随计分版本快照留存。
+    batch_id       TEXT PRIMARY KEY REFERENCES batches(id) ON DELETE CASCADE,
+    analysis_json  TEXT NOT NULL,
+    updated_ts     INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS feedback_reports (
     -- 站级赛后反馈包：每次生成都是不可变快照；发布状态与替代关系在此记录
     id                  TEXT PRIMARY KEY,
@@ -310,7 +318,10 @@ class Storage:
 
     # -- findings ---------------------------------------------------------
     def replace_findings(self, batch_id: str,
-                         findings: list[dict[str, Any]]) -> None:
+                         findings: list[dict[str, Any]],
+                         band_analysis: dict[str, Any] | None = None
+                         ) -> None:
+        """同一事务替换证据集；给出 band_analysis 时一并替换频段分析快照。"""
         with self._lock:
             with self.conn:
                 self.conn.execute("DELETE FROM findings WHERE batch_id = ?",
@@ -320,6 +331,21 @@ class Storage:
                     "VALUES (?, ?, ?)",
                     [(batch_id, f["id"], json.dumps(f, ensure_ascii=False))
                      for f in findings])
+                if band_analysis is not None:
+                    self.conn.execute(
+                        "INSERT INTO band_analysis (batch_id, analysis_json, "
+                        "updated_ts) VALUES (?, ?, ?) "
+                        "ON CONFLICT(batch_id) DO UPDATE SET "
+                        "analysis_json=excluded.analysis_json, "
+                        "updated_ts=excluded.updated_ts",
+                        (batch_id,
+                         json.dumps(band_analysis, ensure_ascii=False), _now()))
+
+    def get_band_analysis(self, batch_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT analysis_json FROM band_analysis WHERE batch_id = ?",
+            (batch_id,)).fetchone()
+        return json.loads(row["analysis_json"]) if row else None
 
     def list_findings(self, batch_id: str,
                       status: str | None = None,
@@ -950,7 +976,9 @@ class Storage:
                               score_before: int, score_after: int,
                               judge: str | None,
                               note: str | None,
-                              build_correction) -> dict[str, Any]:
+                              build_correction,
+                              band_analysis: dict[str, Any] | None = None
+                              ) -> dict[str, Any]:
         """确认改判：二次核对全部绑定后一次性写入并冻结新计分版本。
 
         *build_correction(new_version, snapshot)* 由接口层提供，基于
@@ -1187,6 +1215,16 @@ class Storage:
                         [(case["batch_id"], f["id"],
                           json.dumps(f, ensure_ascii=False))
                          for f in annotated_findings])
+                    if band_analysis is not None:
+                        self.conn.execute(
+                            "INSERT INTO band_analysis (batch_id, "
+                            "analysis_json, updated_ts) VALUES (?, ?, ?) "
+                            "ON CONFLICT(batch_id) DO UPDATE SET "
+                            "analysis_json=excluded.analysis_json, "
+                            "updated_ts=excluded.updated_ts",
+                            (case["batch_id"],
+                             json.dumps(band_analysis, ensure_ascii=False),
+                             _now()))
 
                     new_no = self.next_version_no(case["batch_id"])
                     submissions = self.get_submissions(case["batch_id"])
@@ -1216,6 +1254,7 @@ class Storage:
                         "rules": rules,
                         "decisions": self.list_decisions(case["batch_id"]),
                         "findings": annotated_findings, "results": results,
+                        "band_analysis": band_analysis,
                         "logs": log_manifest,
                         "clock_scheme": ({**scheme_for_hash,
                                           "id": active_scheme["id"],

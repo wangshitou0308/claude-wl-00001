@@ -68,6 +68,17 @@ MODE_ALIASES = {"RY": "CW", "RTTY": "DATA"}
 
 EXCHANGE_TYPES = {"rst", "integer", "string", "grid", "callsign", "enum"}
 
+# 频段切换合规：三类结论对应的默认罚目（须在 penalties 目录中）
+BAND_PENALTY_EXCESS = "BAND_SWITCH_EXCESS"
+BAND_PENALTY_DWELL = "BAND_DWELL_SHORT"
+BAND_PENALTY_AMBIGUOUS = "BAND_SWITCH_AMBIGUOUS"
+
+# 固定语义：首个 QSO 不计数；计数窗口按 UTC 时钟整点；
+# 同一分钟（Cabrillo 时间分辨率为分钟）跨频段的多条记录顺序不明，保留歧义。
+BAND_FIRST_QSO_FREE = "free"
+BAND_HOUR_BOUNDARY_CLOCK_UTC = "clock_utc"
+BAND_SAME_MINUTE_AMBIGUOUS = "ambiguous"
+
 
 def default_rules(contest: str = "DEMO-CW") -> dict[str, Any]:
     """Return a ready-to-use example rule set."""
@@ -113,6 +124,28 @@ def default_rules(contest: str = "DEMO-CW") -> dict[str, Any]:
             "NOT_IN_LOG": {"points": 5, "label": "对方日志无此记录"},
             "DUP": {"points": 0, "label": "重复通联（默认不扣分，可配置）"},
             "UNIQUE_PENALTY": {"points": 10, "label": "裁判手动罚分"},
+            BAND_PENALTY_EXCESS: {"points": 3, "label": "单时钟小时切换频段超限"},
+            BAND_PENALTY_DWELL: {"points": 2, "label": "换频后驻留时长不足"},
+            BAND_PENALTY_AMBIGUOUS: {"points": 3,
+                                     "label": "同分钟跨频段（顺序不明，待裁决）"},
+        },
+        # 频段切换合规分析（每个时钟小时最多切换次数 / 换频后最短驻留时长）。
+        # 策略按日志的 CATEGORY-* 参赛类别匹配（如 CATEGORY-OPERATOR）。
+        # 固定语义：每个台站的第一个 QSO 不视为切换；计数窗口按 UTC 时钟
+        # 整点（[H:00, H+1:00)）；同一分钟内跨频段的多条记录顺序不明，
+        # 只列歧义待裁决，绝不自行排序。
+        "band_compliance": {
+            "enabled": True,
+            # null 表示该限制不检查；启用分析但不设限时只产出歧义待裁决
+            "max_switches_per_clock_hour": None,
+            "min_dwell_seconds": None,
+            "penalty_excess": BAND_PENALTY_EXCESS,
+            "penalty_dwell": BAND_PENALTY_DWELL,
+            "penalty_ambiguous": BAND_PENALTY_AMBIGUOUS,
+            # 按参赛类别覆盖：{"category": "OPERATOR", "match": {"SINGLE-OP": {...}}}
+            # 命中第一个匹配值（合并默认限制）；也可写
+            # {"category": "OPERATOR", "value": "SINGLE-OP", ...} 的单值写法
+            "by_category": [],
         },
         # 可选竞赛窗口，UTC，ISO-8601；为 None 时不检查
         "contest_start": None,
@@ -186,4 +219,58 @@ def validate_rules(rules: dict[str, Any]) -> list[str]:
             need(isinstance(p, dict) and isinstance(p.get("points"), int)
                  and p["points"] >= 0,
                  f"penalties.{code} 需要非负整数 points")
+
+    bc = rules.get("band_compliance", {})
+    if bc is not None:
+        need(isinstance(bc, dict), "band_compliance 必须是对象")
+        if isinstance(bc, dict):
+            msp = bc.get("max_switches_per_clock_hour")
+            need(msp is None or (isinstance(msp, int) and not isinstance(msp, bool)
+                                 and msp >= 0),
+                 "band_compliance.max_switches_per_clock_hour "
+                 "必须是非负整数或 null")
+            dwell = bc.get("min_dwell_seconds")
+            need(dwell is None or (isinstance(dwell, int)
+                                   and not isinstance(dwell, bool) and dwell >= 0),
+                 "band_compliance.min_dwell_seconds 必须是非负整数或 null")
+            for key in ("penalty_excess", "penalty_dwell",
+                        "penalty_ambiguous"):
+                code = bc.get(key)
+                need(code is None or code in penalties,
+                     f"band_compliance.{key} 必须在 penalties 目录中或为 null")
+            by_cat = bc.get("by_category", [])
+            need(isinstance(by_cat, list),
+                 "band_compliance.by_category 必须是列表")
+            if isinstance(by_cat, list):
+                for i, entry in enumerate(by_cat):
+                    need(isinstance(entry, dict)
+                         and isinstance(entry.get("category"), str),
+                         f"band_compliance.by_category[{i}] "
+                         f"需要字符串 category（如 OPERATOR）")
+                    if not isinstance(entry, dict):
+                        continue
+                    has_value = "value" in entry
+                    has_match = isinstance(entry.get("match"), dict)
+                    need(has_value or has_match,
+                         f"band_compliance.by_category[{i}] 需要 value 单值"
+                         f"或 match 映射（类别取值 -> 限制对象）")
+                    overrides = ([entry] if has_value else [])
+                    if has_match:
+                        overrides = [
+                            {"max_switches_per_clock_hour":
+                             ov.get("max_switches_per_clock_hour"),
+                             "min_dwell_seconds": ov.get("min_dwell_seconds")}
+                            for ov in entry["match"].values()
+                            if isinstance(ov, dict)]
+                    for ov in overrides:
+                        m = ov.get("max_switches_per_clock_hour")
+                        need(m is None or (isinstance(m, int)
+                                           and not isinstance(m, bool) and m >= 0),
+                             f"band_compliance.by_category[{i}]"
+                             f".max_switches_per_clock_hour 非法")
+                        d = ov.get("min_dwell_seconds")
+                        need(d is None or (isinstance(d, int)
+                                           and not isinstance(d, bool) and d >= 0),
+                             f"band_compliance.by_category[{i}].min_dwell_seconds "
+                             f"非法")
     return problems

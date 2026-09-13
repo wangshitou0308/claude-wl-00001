@@ -517,6 +517,9 @@ class JudgeHandler(BaseHTTPRequestHandler):
             m = re.fullmatch(r"/api/batches/([^/]+)/disputes", path)
             if m and method == "GET":
                 return self._disputes(m.group(1))
+            m = re.fullmatch(r"/api/batches/([^/]+)/band-switches", path)
+            if m and method == "GET":
+                return self._list_band_switches(m.group(1))
             m = re.fullmatch(r"/api/batches/([^/]+)/findings", path)
             if m and method == "GET":
                 return self._list_findings(m.group(1))
@@ -657,18 +660,23 @@ class JudgeHandler(BaseHTTPRequestHandler):
                        if scheme else None)
         else:
             offsets = offsets_override
-        raw = adjudicate(batch["rules"], submissions,
-                         time_offsets=offsets)["findings"]
+        adjudication = adjudicate(batch["rules"], submissions,
+                                  time_offsets=offsets)
+        raw = adjudication["findings"]
+        band_analysis = adjudication["band_analysis"]
         decisions = self.storage.list_decisions(batch["id"])
         annotated = apply_decisions(batch["rules"], raw, decisions)
         results = score(batch["rules"], annotated)
-        return {"findings": annotated, "results": results}
+        return {"findings": annotated, "results": results,
+                "band_analysis": band_analysis}
 
     def _rerun_store(self, bid: str) -> dict[str, Any]:
         batch = self._get_batch_or_404(bid)
         computed = self._compute_results(batch)
         # Keep finding identity; replace evidence, carry old decisions.
-        self.storage.replace_findings(bid, computed["findings"])
+        self.storage.replace_findings(
+            bid, computed["findings"],
+            band_analysis=computed["band_analysis"])
         self.storage.touch_batch(bid)
         return computed
 
@@ -703,7 +711,9 @@ class JudgeHandler(BaseHTTPRequestHandler):
                           f"在新配对中已不存在，原裁决失去依据，归档待复核")
             archived.append(self.storage.archive_decision(
                 new_id("A"), bid, fid, dec, reason, scheme_id))
-        self.storage.replace_findings(bid, new_findings)
+        self.storage.replace_findings(
+            bid, new_findings,
+            band_analysis=computed["band_analysis"])
         self.storage.touch_batch(bid)
         return {"computed": computed, "archived": archived,
                 "status_before": _status_counts(old_findings)}
@@ -801,7 +811,9 @@ class JudgeHandler(BaseHTTPRequestHandler):
         self.storage.update_rules(bid, merged)
         batch["rules"] = merged
         computed = self._compute_results(batch)
-        self.storage.replace_findings(bid, computed["findings"])
+        self.storage.replace_findings(
+            bid, computed["findings"],
+            band_analysis=computed["band_analysis"])
         self._send_json({"batch": _public_batch(self.storage.get_batch(bid)),
                          "findings_count": len(computed["findings"]),
                          "results_summary": computed["results"]["summary"]})
@@ -1123,11 +1135,20 @@ class JudgeHandler(BaseHTTPRequestHandler):
             "current": {
                 "status_counts": _status_counts(current["findings"]),
                 "findings_count": len(current["findings"]),
-                "results_summary": current["results"]["summary"]},
+                "results_summary": current["results"]["summary"],
+                "band_switching": _band_summary(current["band_analysis"])},
             "preview": {
                 "status_counts": _status_counts(preview["findings"]),
                 "findings_count": len(preview["findings"]),
-                "results_summary": preview["results"]["summary"]},
+                "results_summary": preview["results"]["summary"],
+                "band_switching": _band_summary(preview["band_analysis"])},
+            "band_switching_diff": _diff_band_switching(
+                {"results": current["results"],
+                 "findings": current["findings"],
+                 "band_analysis": current["band_analysis"]},
+                {"results": preview["results"],
+                 "findings": preview["findings"],
+                 "band_analysis": preview["band_analysis"]}),
             "scorecard_diff": _diff_scorecards(
                 current["results"]["scorecards"],
                 preview["results"]["scorecards"]),
@@ -1150,10 +1171,17 @@ class JudgeHandler(BaseHTTPRequestHandler):
         self._send_json({
             "a": {"scheme": _public_scheme(sa),
                   "status_counts": _status_counts(ca["findings"]),
-                  "results_summary": ca["results"]["summary"]},
+                  "results_summary": ca["results"]["summary"],
+                  "band_switching": _band_summary(ca["band_analysis"])},
             "b": {"scheme": _public_scheme(sb),
                   "status_counts": _status_counts(cb["findings"]),
-                  "results_summary": cb["results"]["summary"]},
+                  "results_summary": cb["results"]["summary"],
+                  "band_switching": _band_summary(cb["band_analysis"])},
+            "band_switching_diff": _diff_band_switching(
+                {"results": ca["results"], "findings": ca["findings"],
+                 "band_analysis": ca["band_analysis"]},
+                {"results": cb["results"], "findings": cb["findings"],
+                 "band_analysis": cb["band_analysis"]}),
             "scorecard_diff": _diff_scorecards(
                 ca["results"]["scorecards"], cb["results"]["scorecards"])})
 
@@ -1177,7 +1205,9 @@ class JudgeHandler(BaseHTTPRequestHandler):
         status = q.get("status")
         if status and status not in (
                 "MATCH", "EXCHANGE_DIFF", "TIME_DRIFT", "SUSPECT_CALL",
-                "NO_PARTNER_LOG", "UNIQUE", "DUP"):
+                "NO_PARTNER_LOG", "UNIQUE", "DUP",
+                "BAND_SWITCH_EXCESS", "BAND_DWELL_SHORT",
+                "BAND_SWITCH_AMBIGUOUS"):
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_STATUS",
                            f"未知状态 {status}")
         pending = None
@@ -1206,6 +1236,130 @@ class JudgeHandler(BaseHTTPRequestHandler):
                     if f["pending"] and f["id"] not in decisions]
         annotated = apply_decisions(batch["rules"], findings, decisions)
         self._send_json({"disputes": annotated, "count": len(annotated)})
+
+    # -- 频段切换合规 -------------------------------------------------------
+    def _list_band_switches(self, bid: str) -> None:
+        self._get_batch_or_404(bid)
+        analysis = self.storage.get_band_analysis(bid)
+        if analysis is None:
+            # 兼容历史批次（启用本功能前冻结、从未重跑）：按需现算只读分析
+            batch = self.storage.get_batch(bid)
+            analysis = self._compute_results(batch)["band_analysis"]
+        q = self._query()
+        station = q.get("station")
+        if station:
+            from .parser import normalize_callsign
+            station = normalize_callsign(station) or station.upper()
+        band = q.get("band")
+        status = q.get("status")  # 违规结论状态（含 OK / VIOLATION 元状态）
+        decisions = self.storage.list_decisions(bid)
+        findings_by_id = {f["id"]: f
+                          for f in self.storage.list_findings(bid)}
+
+        stations_out = []
+        total = {"switch": 0, "ambiguous": 0, "excess": 0,
+                 "dwell_short": 0, "violation": 0}
+        for st in analysis.get("stations", []):
+            if station and st["station"] != station:
+                continue
+            policy = st.get("policy") or {}
+            nodes_out = []
+            for node in st.get("chain", []):
+                bands_for_filter = (
+                    [node["to_band"], node["from_band"]]
+                    if node.get("type") == "switch"
+                    else (node.get("ambiguous_bands") or
+                          ([node.get("band")] if node.get("band") else [])))
+                if band and band not in [b for b in bands_for_filter if b]:
+                    continue
+                fmap = node.get("finding") or {}
+                node_status = None
+                finding_summary = []
+                if node.get("type") == "ambiguous":
+                    for v in fmap.get("violations", []):
+                        finding_summary.append(
+                            self._band_finding_summary(
+                                v["finding_id"], v["status"],
+                                findings_by_id, decisions))
+                    node_status = "BAND_SWITCH_AMBIGUOUS"
+                elif fmap.get("violations"):
+                    for v in fmap["violations"]:
+                        finding_summary.append(
+                            self._band_finding_summary(
+                                v["finding_id"], v["status"],
+                                findings_by_id, decisions))
+                    node_status = "VIOLATION"
+                elif node.get("type") == "switch":
+                    node_status = "OK"
+                else:
+                    node_status = node.get("type", "INITIAL").upper()
+                if status:
+                    wanted = {node_status}
+                    if node_status == "VIOLATION":
+                        wanted |= {v["status"] for v in fmap.get(
+                            "violations", [])}
+                    if status not in wanted:
+                        continue
+                nodes_out.append({
+                    "seq": node["seq"], "type": node["type"],
+                    "status": node_status,
+                    "ts": node["ts"], "date": node.get("date"),
+                    "time": node.get("time"),
+                    "hour_window": node.get("hour_window"),
+                    "window_start_ts": node.get("window_start_ts"),
+                    "window_end_ts": node.get("window_end_ts"),
+                    "band": node.get("band"),
+                    "from_band": node.get("from_band"),
+                    "to_band": node.get("to_band"),
+                    "ambiguous_bands": node.get("ambiguous_bands"),
+                    "after_ambiguous": node.get("after_ambiguous"),
+                    "first_qso": node.get("first_qso"),
+                    "interval_seconds": node.get("interval_seconds"),
+                    "interval_from_seq": node.get("interval_from_seq"),
+                    "hourly_count": node.get("hourly_count"),
+                    "refs": node.get("refs"),
+                    "violations": node.get("violations"),
+                    "findings": finding_summary})
+            hours = st.get("hour_windows", [])
+            if band:
+                hours = [h for h in hours if True]  # 窗口为小时级，不按频段滤
+            stations_out.append({
+                "station": st["station"], "policy": policy,
+                "chain": nodes_out, "hour_windows": hours,
+                "summary": st.get("summary")})
+            total["switch"] += st["summary"]["switch_count"]
+            total["ambiguous"] += st["summary"]["ambiguous_count"]
+            total["excess"] += st["summary"]["excess_count"]
+            total["dwell_short"] += st["summary"]["dwell_short_count"]
+            total["violation"] += st["summary"]["violation_count"]
+        self._send_json({
+            "batch_id": bid,
+            "enabled": analysis.get("enabled", True),
+            "time_basis": analysis.get("time_basis", "corrected_utc"),
+            "semantics": analysis.get("semantics"),
+            "stations": stations_out,
+            "summary": total,
+            "filters": ({"station": station, "band": band,
+                         "status": status}),
+        })
+
+    @staticmethod
+    def _band_finding_summary(fid: str, default_status: str,
+                              findings_by_id: dict[str, dict[str, Any]],
+                              decisions: dict[str, dict[str, Any]]
+                              ) -> dict[str, Any]:
+        f = findings_by_id.get(fid)
+        dec = decisions.get(fid)
+        return {
+            "finding_id": fid,
+            "status": (f or {}).get("status", default_status),
+            "pending": bool((f or {}).get("pending")),
+            "decision": ({"resolution": dec["resolution"],
+                          "reason": dec["reason"],
+                          "judge": dec.get("judge")}
+                         if dec else None),
+            "auto_reason": (f or {}).get("auto_reason"),
+            "band_switch": (f or {}).get("band_switch")}
 
     def _get_finding(self, bid: str, fid: str) -> None:
         self._get_batch_or_404(bid)
@@ -1329,6 +1483,7 @@ class JudgeHandler(BaseHTTPRequestHandler):
             "decisions": decisions,
             "findings": computed["findings"],
             "results": computed["results"],
+            "band_analysis": computed["band_analysis"],
             "logs": log_manifest,
             "clock_scheme": ({**scheme_slim, "id": scheme["id"],
                               "name": scheme["name"]}
@@ -1377,7 +1532,8 @@ class JudgeHandler(BaseHTTPRequestHandler):
             vb = {"version_no": "current",
                   "snapshot": {"results": computed["results"],
                                "decisions": decisions,
-                               "findings": computed["findings"]}}
+                               "findings": computed["findings"],
+                               "band_analysis": computed["band_analysis"]}}
         self._send_json({
             "a": va["version_no"], "b": vb["version_no"],
             "scorecards": _diff_scorecards(
@@ -1392,6 +1548,8 @@ class JudgeHandler(BaseHTTPRequestHandler):
             "finding_status_counts": {
                 "a": _status_counts(va["snapshot"]["findings"]),
                 "b": _status_counts(vb["snapshot"]["findings"])},
+            "band_switching": _diff_band_switching(
+                va["snapshot"], vb["snapshot"]),
             "content_hash": {"a": va["content_hash"],
                              "b": vb["snapshot"].get("content_hash")},
         })
@@ -2111,7 +2269,8 @@ class JudgeHandler(BaseHTTPRequestHandler):
             version_digest=None, clock_scheme_slim=self._scheme_slim(ver),
             score_before=outcome["station_score"]["before"],
             score_after=outcome["station_score"]["after"],
-            judge=judge, note=note, build_correction=build_correction)
+            judge=judge, note=note, build_correction=build_correction,
+            band_analysis=snapshot.get("band_analysis"))
         payload = self._appeal_payload(self.storage.get_appeal_case(cid))
         payload["confirmed"] = True
         payload["frozen"] = result["frozen"]
@@ -2215,6 +2374,138 @@ def _dict_changed(a: dict[str, Any], b: dict[str, Any]) -> list[str]:
     return sorted(k for k in set(a) & set(b) if a[k].get("resolution") !=
                   b[k].get("resolution") or a[k].get("reason") !=
                   b[k].get("reason"))
+
+
+def _band_summary(analysis: dict[str, Any]) -> dict[str, Any]:
+    stations = analysis.get("stations", []) if analysis else []
+    return {
+        "enabled": bool(analysis and analysis.get("enabled", True)),
+        "stations": len(stations),
+        "switch_count": sum(s["summary"]["switch_count"] for s in stations),
+        "ambiguous_count": sum(
+            s["summary"]["ambiguous_count"] for s in stations),
+        "excess_count": sum(s["summary"]["excess_count"] for s in stations),
+        "dwell_short_count": sum(
+            s["summary"]["dwell_short_count"] for s in stations),
+    }
+
+
+def _band_trajectory(stations: list[dict[str, Any]]
+                     ) -> dict[str, list[dict[str, Any]]]:
+    """把每站切换链压缩为可比较轨迹（只留决定轨迹的字段）。"""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for st in stations or []:
+        traj = []
+        for node in st.get("chain", []):
+            item = {"type": node["type"], "ts": node["ts"],
+                    "from_band": node.get("from_band"),
+                    "to_band": node.get("to_band"),
+                    "ambiguous_bands": node.get("ambiguous_bands")}
+            traj.append(item)
+        out[st["station"]] = traj
+    return out
+
+
+def _band_violation_index(snapshot: dict[str, Any]
+                          ) -> dict[tuple[str, str], dict[str, Any]]:
+    """快照中频段违规证据的索引：(台站, 原日志行集合) -> 结论/罚分。"""
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for f in snapshot.get("findings", []):
+        if f.get("status") not in ("BAND_SWITCH_EXCESS", "BAND_DWELL_SHORT",
+                                   "BAND_SWITCH_AMBIGUOUS"):
+            continue
+        if not f.get("refs"):
+            continue
+        owner = f["refs"][0].get("station")
+        lines = ",".join(sorted(f"{r.get('filename')}:{r.get('line')}"
+                                for r in f["refs"]))
+        eff = (f.get("effects") or {}).get(owner) or {}
+        out[(owner, lines)] = {
+            "status": f["status"],
+            "clause": (f.get("band_switch") or {}).get("clause"),
+            "penalty_points": eff.get("penalty_points", 0),
+            "penalty_codes": eff.get("penalty_codes", []),
+            "resolution": (f.get("decision") or {}).get("resolution"),
+            "id": f["id"]}
+    return out
+
+
+def _diff_band_switching(snap_a: dict[str, Any],
+                         snap_b: dict[str, Any]) -> dict[str, Any]:
+    """比较两个版本（或版本与当前结果）的频段切换违规、罚分与轨迹变化。"""
+    ba = snap_a.get("band_analysis") or {"stations": []}
+    bb = snap_b.get("band_analysis") or {"stations": []}
+    ta = _band_trajectory(ba.get("stations", []))
+    tb = _band_trajectory(bb.get("stations", []))
+    trajectory_changed = []
+    for st in sorted(set(ta) | set(tb)):
+        if ta.get(st, []) != tb.get(st, []):
+            trajectory_changed.append({
+                "station": st,
+                "a": ta.get(st, []),
+                "b": tb.get(st, [])})
+
+    def _sum(snap: dict[str, Any], key: str) -> int:
+        return int(((snap.get("results") or {}).get("summary") or {})
+                   .get("band_switch", {}).get(key, 0))
+
+    va = _band_violation_index(snap_a)
+    vb = _band_violation_index(snap_b)
+    added, removed, changed = [], [], []
+    for key in sorted(set(va) | set(vb)):
+        x, y = va.get(key), vb.get(key)
+        if x is None:
+            added.append({"station": key[0], "refs": key[1], **y})
+        elif y is None:
+            removed.append({"station": key[0], "refs": key[1], **x})
+        elif (x["status"], x["penalty_points"], x["resolution"]) != \
+                (y["status"], y["penalty_points"], y["resolution"]):
+            changed.append({"station": key[0], "refs": key[1],
+                            "a": x, "b": y})
+    # 每站频段类罚分差值（由违规证据的 effects 聚合）
+    band_codes = {"BAND_SWITCH_EXCESS", "BAND_DWELL_SHORT",
+                  "BAND_SWITCH_AMBIGUOUS"}
+    penalty_rows = []
+
+    def _station_band_penalty(snap: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for f in snap.get("findings", []):
+            if f.get("status") not in band_codes or not f.get("refs"):
+                continue
+            owner = f["refs"][0].get("station")
+            eff = (f.get("effects") or {}).get(owner) or {}
+            row = out.setdefault(owner, {"points": 0, "codes": set()})
+            row["points"] += int(eff.get("penalty_points", 0))
+            row["codes"].update(c for c in eff.get("penalty_codes", [])
+                                if c in band_codes)
+        return out
+
+    pa = _station_band_penalty(snap_a)
+    pb = _station_band_penalty(snap_b)
+    for st in sorted(set(pa) | set(pb)):
+        xa, xb = pa.get(st, {"points": 0, "codes": set()}), \
+            pb.get(st, {"points": 0, "codes": set()})
+        if xa["points"] != xb["points"] or xa["codes"] != xb["codes"]:
+            penalty_rows.append({
+                "station": st,
+                "penalty_points": {"a": xa["points"], "b": xb["points"],
+                                   "delta": xb["points"] - xa["points"]},
+                "band_penalty_codes": {"a": sorted(xa["codes"]),
+                                       "b": sorted(xb["codes"])}})
+    return {
+        "counts": {
+            "a": {"excess": _sum(snap_a, "excess"),
+                  "dwell_short": _sum(snap_a, "dwell_short"),
+                  "ambiguous": _sum(snap_a, "ambiguous")},
+            "b": {"excess": _sum(snap_b, "excess"),
+                  "dwell_short": _sum(snap_b, "dwell_short"),
+                  "ambiguous": _sum(snap_b, "ambiguous")}},
+        "violations_added": added,
+        "violations_removed": removed,
+        "violations_changed": changed,
+        "trajectory_changed": trajectory_changed,
+        "band_penalties": penalty_rows,
+    }
 
 
 def _diff_scorecards(a: list[dict[str, Any]],

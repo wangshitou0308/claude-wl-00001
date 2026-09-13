@@ -31,10 +31,11 @@ import hashlib
 import json
 from typing import Any
 
+from .bandswitch import analyze_band_switching
 from .parser import _exchange_equal  # internal reuse, same package
 
 PENDING_STATUSES = {"EXCHANGE_DIFF", "TIME_DRIFT", "SUSPECT_CALL",
-                    "NO_PARTNER_LOG"}
+                    "NO_PARTNER_LOG", "BAND_SWITCH_AMBIGUOUS"}
 
 # Resolution values a judge may record on a decision.
 RESOLUTIONS = {"CONFIRMED", "REMOVED", "GRANTED", "WAIVED"}
@@ -48,6 +49,19 @@ RESOLUTION_ALLOWED: dict[str, set[str]] = {
     "UNIQUE": {"WAIVED", "REMOVED", "GRANTED"},
     "DUP": {"WAIVED", "REMOVED"},
     "MATCH": {"REMOVED"},
+    # 频段切换合规：确定性违规可豁免/剔除；歧义段经裁判确认构成违规、
+    # 豁免（顺序不构成违规）或剔除
+    "BAND_SWITCH_EXCESS": {"WAIVED", "REMOVED"},
+    "BAND_DWELL_SHORT": {"WAIVED", "REMOVED"},
+    "BAND_SWITCH_AMBIGUOUS": {"CONFIRMED", "WAIVED", "REMOVED"},
+}
+
+# 频段切换合规 finding 状态
+BAND_DETERMINED_STATUSES = ("BAND_SWITCH_EXCESS", "BAND_DWELL_SHORT")
+BAND_CLAUSE_STATUS = {
+    "max_switches_per_clock_hour": "BAND_SWITCH_EXCESS",
+    "min_dwell_seconds": "BAND_DWELL_SHORT",
+    "ambiguous_same_minute": "BAND_SWITCH_AMBIGUOUS",
 }
 
 
@@ -195,6 +209,124 @@ def _exchange_diffs(rules: dict[str, Any], a: dict[str, Any],
                           "received": b["recv"][name],
                           "counterparty_sent": a["sent"][name]})
     return diffs
+
+
+def _band_finding_id(status: str, refs: list[dict[str, Any]],
+                     clause: str) -> str:
+    # 同一分钟的多条记录与条款构成稳定身份；finding id 含状态，
+    # 规则变化使状态改变时旧裁决即失去依据（与配对证据同口径归档）。
+    key = json.dumps(
+        {"s": status, "c": clause,
+         "r": sorted(f"{r['filename']}:{r['line']}" for r in refs)},
+        ensure_ascii=False, sort_keys=True)
+    return "F-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+
+
+def _band_findings(band_analysis: dict[str, Any]
+                   ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """把频段切换链上的违规/歧义节点转为 finding，并回填节点映射。"""
+    findings: list[dict[str, Any]] = []
+    # {(station, seq): {"finding_id": ..., "status": ..., "violations": [...]}}
+    node_map: dict[tuple[str, int], dict[str, Any]] = {}
+    for st in band_analysis.get("stations", []):
+        policy = st.get("policy") or {}
+        if not policy.get("enabled", False):
+            continue
+        for node in st.get("chain", []):
+            refs = node.get("refs") or []
+            if node["type"] == "ambiguous":
+                status = BAND_CLAUSE_STATUS["ambiguous_same_minute"]
+                bands = "、".join(node.get("ambiguous_bands") or [])
+                reason = (f"{st['station']} 在 {node['date']} {node['time']} "
+                          f"同一分钟内记录了跨频段（{bands}）多条 QSO，"
+                          f"先后顺序无法判定；系统不自行排序，需裁判确认"
+                          f"是否构成违规切换")
+                detail = {"clause": "ambiguous_same_minute",
+                          "node_seq": node["seq"],
+                          "hour_window": node.get("hour_window"),
+                          "from_band": node.get("from_band"),
+                          "ambiguous_bands": node.get("ambiguous_bands"),
+                          "policy": _policy_slim(policy)}
+                finding = _make_band_finding(
+                    status, refs, reason, node["ts"], detail, pending=True)
+                findings.append(finding)
+                node_map[(st["station"], node["seq"])] = {
+                    "finding_id": finding["id"], "status": status,
+                    "violations": [{
+                        "finding_id": finding["id"], "status": status,
+                        "clause": "ambiguous_same_minute"}]}
+                continue
+            for v in node.get("violations") or []:
+                clause = v["clause"]
+                status = BAND_CLAUSE_STATUS.get(clause)
+                if not status:
+                    continue
+                detail = {
+                    "clause": clause,
+                    "node_seq": node["seq"],
+                    "hour_window": node.get("hour_window"),
+                    "from_band": node.get("from_band"),
+                    "to_band": node.get("to_band"),
+                    "interval_seconds": node.get("interval_seconds"),
+                    "interval_from_seq": node.get("interval_from_seq"),
+                    "hourly_count": node.get("hourly_count"),
+                    "limit": v.get("limit"),
+                    "policy": _policy_slim(policy)}
+                if clause == "max_switches_per_clock_hour":
+                    reason = (f"{st['station']} 在 {node['hour_window']} "
+                              f"时钟小时内第 {v['hourly_count']} 次由 "
+                              f"{node['from_band']} 切换至 {node['to_band']}"
+                              f"（{node['date']} {node['time']}），"
+                              f"超过每小时最多 {v['limit']} 次的限制；"
+                              f"{v['detail']}")
+                else:
+                    reason = (f"{st['station']} 由 {node['from_band']} 切换至 "
+                              f"{node['to_band']}（{node['date']} "
+                              f"{node['time']}）时，上一频段驻留仅 "
+                              f"{node['interval_seconds']} 秒，"
+                              f"{v['detail']}")
+                finding = _make_band_finding(
+                    status, refs, reason, node["ts"], detail, pending=False)
+                findings.append(finding)
+                entry = node_map.setdefault(
+                    (st["station"], node["seq"]),
+                    {"finding_id": None, "status": None, "violations": []})
+                entry["violations"].append(
+                    {"finding_id": finding["id"], "status": status,
+                     "clause": clause})
+    return findings, node_map
+
+
+def _policy_slim(policy: dict[str, Any]) -> dict[str, Any]:
+    """写入每条频段证据的策略快照（触发条款的可复核依据）。"""
+    return {k: policy.get(k) for k in (
+        "enabled", "max_switches_per_clock_hour", "min_dwell_seconds",
+        "matched", "category", "category_value", "category_source",
+        "semantics", "penalty_excess", "penalty_dwell", "penalty_ambiguous")}
+
+
+def _make_band_finding(status: str, refs: list[dict[str, Any]],
+                       reason: str, ts_hint: int,
+                       detail: dict[str, Any], *, pending: bool
+                       ) -> dict[str, Any]:
+    stations = sorted({r["station"] for r in refs if r.get("station")})
+    bands = sorted({r["band"] for r in refs if r.get("band")})
+    return {
+        "id": _band_finding_id(status, refs, detail["clause"]),
+        "status": status,
+        "pending": pending,
+        "band": detail.get("to_band") or (bands[-1] if bands else None),
+        "mode": None,
+        "ts_hint": ts_hint,
+        "stations": stations,
+        "refs": refs,
+        "clock_corrected": any(r.get("offset_seconds") for r in refs),
+        "time_delta_seconds": None,
+        "exchange_diffs": [],
+        "call_detail": {},
+        "auto_reason": reason,
+        "band_switch": detail,
+    }
 
 
 def adjudicate(rules: dict[str, Any],
@@ -417,7 +549,22 @@ def adjudicate(rules: dict[str, Any],
                 _ets(sub_a, qa)))
 
     findings.sort(key=lambda f: (f["ts_hint"], f["status"], f["id"]))
-    return {"findings": findings}
+
+    # ------------------------------------------------------------------
+    # 5) 频段切换合规分析（按校正后 UTC 时间；与交叉配对待的证据并列）。
+    # ------------------------------------------------------------------
+    band_analysis = analyze_band_switching(rules, submissions,
+                                           time_offsets=offsets)
+    band_findings, node_map = _band_findings(band_analysis)
+    for st in band_analysis.get("stations", []):
+        for node in st.get("chain", []):
+            mapped = node_map.get((st["station"], node["seq"]))
+            if mapped:
+                node["finding"] = mapped
+    band_findings.sort(key=lambda f: (f["ts_hint"], f["status"], f["id"]))
+    findings.extend(band_findings)
+    findings.sort(key=lambda f: (f["ts_hint"], f["status"], f["id"]))
+    return {"findings": findings, "band_analysis": band_analysis}
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +664,30 @@ def apply_decisions(rules: dict[str, Any], findings: list[dict[str, Any]],
             if resolution != "WAIVED":
                 code = "DUP"
                 if _catalogue_penalty(rules, code):
+                    e["penalty_codes"].append(code)
+                    e["penalty_points"] += _catalogue_penalty(rules, code)
+            effects[owner] = e
+        elif f["status"] in ("BAND_SWITCH_EXCESS", "BAND_DWELL_SHORT",
+                             "BAND_SWITCH_AMBIGUOUS"):
+            # 频段切换合规证据只影响归属台站，不改变任何通联的计分。
+            # 确定性违规（超限/驻留不足）默认按策略罚目自动罚分，WAIVED
+            # 豁免、REMOVED 剔除；歧义段仅在裁判 CONFIRMED 后罚分，
+            # 罚目可取裁决指定值或策略快照中的 penalty_ambiguous。
+            e = blank(owner)
+            detail = f.get("band_switch") or {}
+            policy = detail.get("policy") or {}
+            if f["status"] in BAND_DETERMINED_STATUSES:
+                if resolution not in ("WAIVED", "REMOVED"):
+                    code = (policy.get("penalty_excess")
+                            if f["status"] == "BAND_SWITCH_EXCESS"
+                            else policy.get("penalty_dwell"))
+                    if code and code in rules.get("penalties", {}):
+                        e["penalty_codes"].append(code)
+                        e["penalty_points"] += _catalogue_penalty(rules, code)
+            elif resolution == "CONFIRMED":
+                code = (dec.get("penalty_code")
+                        or policy.get("penalty_ambiguous"))
+                if code and code in rules.get("penalties", {}):
                     e["penalty_codes"].append(code)
                     e["penalty_points"] += _catalogue_penalty(rules, code)
             effects[owner] = e
@@ -624,6 +795,14 @@ def score(rules: dict[str, Any],
                        and not f.get("decision")),
         "stations": len(result_cards),
         "sum_total_score": sum(c["total_score"] for c in result_cards),
+        "band_switch": {
+            "excess": sum(1 for f in annotated
+                          if f["status"] == "BAND_SWITCH_EXCESS"),
+            "dwell_short": sum(1 for f in annotated
+                               if f["status"] == "BAND_DWELL_SHORT"),
+            "ambiguous": sum(1 for f in annotated
+                             if f["status"] == "BAND_SWITCH_AMBIGUOUS"),
+        },
     }
     return {"scorecards": result_cards, "summary": totals}
 
@@ -646,7 +825,7 @@ def content_hash(rules: dict[str, Any], findings: list[dict[str, Any]],
                       if k in ("id", "status", "band", "mode", "ts_hint",
                                "stations", "refs", "time_delta_seconds",
                                "exchange_diffs", "call_detail",
-                               "auto_reason", "pending")}
+                               "auto_reason", "pending", "band_switch")}
                      for f in findings]
     payload = {"rules": rules, "findings": slim_findings,
                "decisions": decisions, "results": results,
